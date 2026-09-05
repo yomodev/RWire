@@ -23,77 +23,166 @@ diverging.
 
 ## Current phase
 
-**Phase 3 — Reference counting** (implementation written, not yet
-built/run — see "Notes / blockers" below)
+**Phase 4 — TABLE type & bulk transfer** (implementation written, not
+yet built/run) **plus a large unplanned hardening pass** requested
+directly against real build/test output — this is the first point in
+the project where actual `dotnet build`/`dotnet test` results (not
+just code review) drove changes. See below.
 
-Phase 2 status: still "code written, unbuilt" as of this update — it
-was not built/tested before Phase 3 work started. Build and test
-Phase 2 and Phase 3 together; there's no meaningful checkpoint between
-them anymore since Phase 3 builds directly on Phase 2's RValueCodec.
+### Phase 4 itself
 
-Phase 3 adds, on top of Phase 2:
+- `RTypeTag.Table`, `RValue.RowCount`/`OfTable`/`FromWireTable`/
+  `GetTableColumns()`, and `RValueCodec` encode/decode for it. Table
+  reuses the existing List shape (element count = column count,
+  Names = column names, Class = R class) plus one extra `RowCount`
+  int32 written right after the type tag - see spec.md section 6.2.
+- `worker.R`: `is.data.frame(x)` gets its own branch in `write_r_value`
+  *before* the generic `is.list(x)` check (a data.frame is a list, so
+  order matters) that deliberately does **not** reuse the shared
+  `write_attributes()` helper - `dim(x)` for a data.frame invokes the
+  `dim.data.frame` S3 *method* (computed from nrow/ncol) rather than
+  reading a literal stored attribute, and blindly round-tripping that
+  would attach a spurious literal `dim` attribute on reconstruction.
+  `read_r_value`'s `RTAG_TABLE` branch sets `row.names` explicitly via
+  `attr<-` (bypassing the validating `row.names<-.data.frame` method,
+  since the state being set is already known-correct) and calls
+  `data.table::setDT()` when the class includes `"data.table"`.
+- **Not implemented**: the actual zero-copy/streaming-without-a-
+  precomputed-buffer optimization spec.md section 6.2 describes as
+  the point of the TABLE type. Both C# (`ArrayBufferWriter`) and R
+  (`rawConnection`) still buffer the fully-encoded value before it
+  goes out over `RConnection.Send`/`write_frame`. What's implemented
+  is TABLE's wire *format* and full round-trip correctness (a real
+  win over encoding a data.frame as a generic list of columns, which
+  is what happened before this phase) - not yet the bulk-transfer
+  performance property that was the entire point of designing it.
+  Making that real requires restructuring `RConnection.Send`/
+  `write_frame` to accept a streaming-write callback instead of a
+  pre-built buffer, on both sides - a distinct, larger task, most
+  naturally tackled in Phase 7.
+- List-of-tables (spec.md section 6.3) works as a side effect of
+  Table being just another `RValue` - a `List` containing `Table`
+  elements round-trips correctly (tested in both
+  `RValueCodecTests.Table_ListOfTables_RoundTrips` and
+  `TablePerformanceTests`). The `IAsyncEnumerable<RTable>`-based lazy,
+  consume-while-still-arriving API spec.md describes is **not**
+  implemented - the whole-buffer architecture above means "table N+1
+  starts decoding while table N is still being consumed" isn't
+  possible yet without that same streaming rework.
 
-Implemented:
-- `src/RWire/RHandle.cs` — thin `IDisposable` proxy (not `SafeHandle` —
-  see "Decisions changed since spec.md") stamped with the owning
-  `ProcessSupervisor`'s `SessionId`; `Dispose()` calls
-  `ReleaseHandleBestEffort` (fire-and-forget, exception-swallowing —
-  Dispose must never throw); a finalizer exists as the last-resort net
-  spec.md describes, not the primary path.
-- `src/RWire/RCallArgument.cs` — discriminated union (inline `RValue`
-  or `RHandle`) with implicit conversions from both, so
-  `Call`/`CallAsync` call sites rarely need to construct it explicitly.
-  This **changed the public signature** of `Call`/`CallAsync` from
-  `IReadOnlyList<RValue>` to `IReadOnlyList<RCallArgument>` — a source
-  break from Phase 2, fixed up in `EvalCallIntegrationTests.cs`.
-- `src/RWire/ProcessSupervisor.cs` — added:
-  - `SessionId` (a process-wide monotonic counter via
-    `Interlocked.Increment`, stamped on every `RHandle` created by
-    this instance) and `ValidateHandle` (throws `ObjectDisposedException`
-    if a handle's `SessionId` doesn't match — stands in for "this
-    handle survived a restart it shouldn't have," ready for Phase 6
-    even though restart doesn't exist yet).
-  - `SetObj`/`SetObjAsync`, `GetObj`/`GetObjAsync`,
-    `CreateRef`/`CreateRefAsync` (sync+async, same pattern as
-    `Eval`/`Call`: `RErrorException` restores `Ready`, everything else
-    faults). `Call`/`CallAsync` updated to validate and resolve any
-    handle arguments *before* acquiring the connection lock / entering
-    `Busy` — an already-disposed handle is a client bug and must throw
-    `ObjectDisposedException` without touching supervisor state, not
-    get treated as a connection failure.
-  - `ReleaseRefAsync` (internal) and `ReleaseHandleBestEffort` — the
-    actual RELEASE_REF call and the fire-and-forget wrapper
-    RHandle.Dispose/finalizer use.
-  - Wire helpers `EncodeHandleId`/`DecodeHandleIdResult` (8-byte LE
-    handle IDs) and `EnsureSuccessAck` (RESULT-with-empty-payload =
-    success, shared by CREATE_REF/RELEASE_REF).
-- `r/worker.R` — the object registry (`.rwire_registry`, an
-  `environment()`-as-hashtable), handle ID allocation (see "Decisions
-  changed since spec.md" — 32-bit, not the full 64-bit wire slot),
-  `SET_OBJ`/`GET_OBJ`/`CREATE_REF`/`RELEASE_REF` handlers, the
-  leak-guard sweep (piggybacked on the existing `PING` handler rather
-  than a separate timer), and `CALL`'s handle-argument branch now
-  actually resolves via the registry instead of throwing "not
-  implemented."
-- Tests: `HandleLifecycleTests.cs` covering the full spec §12.4 list
-  (set→get round-trip, dispose→registry-empty, use-after-dispose
-  throws, two-handles-via-CreateRef, double-release-is-a-no-op) plus a
-  session-mismatch test standing in for the "old handle after a crash/
-  restart" scenario (using a second, independent `ProcessSupervisor`
-  instance, since Phase 6's actual restart doesn't exist yet — this
-  tests the piece Phase 3 owns: the `SessionId` check itself, not the
-  restart machinery around it). `EvalCallIntegrationTests.cs` updated
-  for the `RCallArgument` signature change and given a new
-  handle-as-CALL-argument test.
+### Bug fixes from real test output
 
-Not yet implemented (by design — later phases):
-- `TABLE` type (Phase 4).
-- Full crash/restart integration with the handle registry — Phase 6
-  needs to actually invalidate *all* outstanding handles from a
-  session when that session's process is replaced; today `SessionId`
-  only prevents a handle from a genuinely different `ProcessSupervisor`
-  instance from being misused, which is the right primitive but isn't
-  wired into any restart logic yet because there isn't any.
+Three failures came from an actual `dotnet test` run against Phases
+1-3 (first time this project has run against a real compiler/test
+runner). All three are fixed:
+
+1. **`EnsureReady()` rejected the transient `Busy` state.** A
+   background `ReleaseHandleBestEffort` call and a foreground
+   diagnostic `EvalAsync` raced; the foreground call checked `State`
+   before queuing on `_connectionLock` and threw
+   `InvalidOperationException` because it observed `Busy`. Fixed:
+   `EnsureReady()` now only rejects genuinely unusable states
+   (`Faulted`, `Disposed`, pre-`Ready`) - `Busy` means "someone else
+   is using the connection right now," which is exactly what
+   `_connectionLock` exists to serialize, not a reason to refuse a
+   legitimate concurrent caller.
+2. **`Dispose_SendsGracefulShutdown_AndProcessExitsCleanly` threw "No
+   process is associated with this object."** The test read
+   `Process.HasExited`/`ExitCode` *after* `supervisor.Dispose()`,
+   which itself calls `_process.Dispose()` - .NET's `Process` throws
+   on property access once disposed. Fixed: `ProcessSupervisor` now
+   exposes `public int? ExitCode { get; }`, captured right before
+   `_process.Dispose()` runs, so callers/tests never need to touch
+   the underlying `Process` after `Dispose()`.
+3. **`DiagnosticOutput_CapturesStderr_OnWorkerScriptError` was flaky**
+   with the old `BeginOutputReadLine`/`OutputDataReceived` event
+   pattern and a fixed `Task.Delay(200)`. Fixed as part of the async
+   stdio rewrite below - the test now polls instead of guessing a
+   delay, and the pump tasks start immediately after `Process.Start()`
+   rather than depending on the event-loop's own internal timing.
+
+### Architecture changes requested directly (not from spec.md)
+
+- **Connection creation is now dependency-injected.**
+  `IRChannelListener` (new) abstracts "bind + accept the R worker's
+  connect-back" the way `IRChannel` already abstracted "read/write
+  once connected." `ProcessSupervisor` takes an `IRChannelListener` in
+  its constructor (defaulting to the new `TcpRChannelListener` if you
+  use the single-argument constructor) and never touches
+  `TcpListener`/`TcpClient` directly anymore. This was a real gap:
+  Phase 1's channel-agnostic goal covered the data channel
+  (`IRChannel`) but `ProcessSupervisor` still hardcoded the listener
+  side of establishing that channel.
+- **Errors are confirmed structured, and made richer.** They were
+  already sent over the protocol's data channel (never stdout/stderr)
+  before this change, but only as a bare message string.
+  `RErrorException` now carries `Classes` (R's condition class
+  hierarchy) and `Call` (the deparsed call, if R attached one), and
+  `worker.R`'s `build_error_payload` accepts a real condition object
+  (or wraps a plain string in `simpleError()` for protocol-level
+  errors that aren't real R conditions) instead of just
+  `conditionMessage(e)`. All four ERROR-decode call sites in
+  `ProcessSupervisor` were consolidated into one `DecodeError` helper.
+- **Stdout/stderr capture rewritten as async pump tasks.**
+  `Process.BeginOutputReadLine()`/`OutputDataReceived` replaced with
+  two `PumpStreamAsync` loops (`StandardOutput.ReadLineAsync()`/
+  `StandardError.ReadLineAsync()`), started immediately after
+  `Process.Start()`. `Dispose()` awaits both (with a timeout) after
+  confirming the process has exited, so `DiagnosticOutput` is
+  guaranteed to have seen every line by the time `Dispose()` returns -
+  no more guessing with a fixed delay.
+- **Test fixtures added**: `RWireProcessFixture` +
+  `RWireProcessCollection` (xUnit collection fixture) share one
+  R process across `EvalCallIntegrationTests`, `HandleLifecycleTests`,
+  and `TablePerformanceTests` - none of those tests dispose or
+  otherwise disrupt the shared supervisor's lifecycle, they only make
+  ordinary calls against it. `ProcessSupervisorTests` (handshake
+  failure, external kill, graceful shutdown) deliberately keeps
+  per-test isolated instances, since those tests need to control a
+  full process lifecycle themselves.
+- **AwesomeAssertions** replaces raw `Assert.*` across every test file
+  (`.Should()`-style fluent assertions).
+- **`RandomTableGenerator`** (test-only) builds a table with one
+  column of every supported atomic type (logical/integer/double/
+  character/raw, each with a configurable NA-injection probability
+  where the type has an NA concept) and mixed lists combining tables
+  with plain vectors. **`TablePerformanceTests`** is a `[Theory]`
+  sweep over row counts (100 / 1,000 / 10,000 / 100,000) plus mixed-
+  list sizes, asserting correctness and logging (not gating on) timing
+  via `ITestOutputHelper` - there's no reference machine here to set a
+  meaningful pass/fail threshold against, and Phase 4's current
+  whole-buffer implementation isn't the design the timings would
+  ultimately need to be judged against anyway (see above). Read the
+  logged numbers once you can actually run this; don't treat the tests
+  passing as a performance claim.
+- **`testthat` added on the R side** (`r/tests/testthat.R` +
+  `r/tests/testthat/*.R`), confirmed acceptable. Required one small
+  change to `worker.R` itself: the final `tryCatch(main(...), ...)`
+  call is now guarded by
+  `if (!isTRUE(getOption("rwire.testing", FALSE)))`, so the script's
+  function definitions can be `source()`d for testing without
+  immediately trying to connect as a live worker process.
+  `test-value-codec.R`, `test-frame-codec.R`, and `test-registry.R`
+  mirror the equivalent C# unit test files' coverage using
+  `rawConnection` instead of a real socket - no C# process involved.
+
+### The "rewrite the R side in C" question
+
+Asked directly, answered in prose rather than code: **don't expect
+much**, and this is a genuine judgment call, not a benchmarked number.
+R's `writeBin`/`readBin` already execute in C internally for the
+vectorized types (integer/double/raw/logical) that dominate large
+TABLE transfers - a rewrite would only remove R-interpreter dispatch
+overhead from the *control-plane* logic (function call overhead, S3
+dispatch, environment/registry lookups via `assign()`/`get()`), which
+is a small fraction of total time for anything payload-heavy. Rough,
+unverified guess: low single digits of percent for large-table
+transfers (bound by memcpy/socket throughput either way), possibly
+noticeably more - maybe 10-20% - for a workload dominated by many
+small, frequent calls where interpreter dispatch is a bigger fraction
+of each call's total time. Real profiling (Phase 7) would be needed
+before trusting either number; this shouldn't be read as a case either
+for or against a C rewrite on its own.
 
 ## Locked-in decisions (see spec.md for full detail/rationale)
 
@@ -120,18 +209,18 @@ Not yet implemented (by design — later phases):
 ## Phase checklist
 
 - [x] Phase 0 — Skeleton & handshake (superseded by Phase 1's real handshake)
-- [~] Phase 1 — Channel abstraction & frame protocol (builds; tests not yet confirmed passing)
+- [~] Phase 1 — Channel abstraction & frame protocol (builds; some bugs found/fixed via real test output, not all re-verified since)
 - [ ] Phase 2 — Atomic type mapping (hot path) (code written, unbuilt)
 - [ ] Phase 3 — Reference counting (code written, unbuilt)
-- [ ] Phase 4 — `TABLE` type & bulk transfer
+- [ ] Phase 4 — `TABLE` type & bulk transfer (code written, unbuilt; streaming optimization deferred - see above)
 - [ ] Phase 5 — Cold path (serialize/unserialize) + irregular lists
 - [ ] Phase 6 — Process supervision & resilience
-- [ ] Phase 7 — Performance hardening
+- [ ] Phase 7 — Performance hardening (now also owns: real TABLE streaming, and validating the "rewrite in C" question with actual profiling)
 
 Each phase's detail doc has its own finer-grained checklist — this
 top-level one is just for at-a-glance status. `[~]` means "builds but
-not test-verified"; nothing gets a plain `[x]` until `dotnet test`
-has actually passed for that phase's suite.
+not fully test-verified"; nothing gets a plain `[x]` until
+`dotnet test` has actually passed in full for that phase's suite.
 
 ## Decisions changed since spec.md was written
 
@@ -205,38 +294,108 @@ has actually passed for that phase's suite.
   programming error, not a connection or protocol failure, and must
   not fault the supervisor the way a genuine wire-level problem would.
 
+- **TABLE's zero-copy/streaming goal (spec.md section 6.2) is not yet
+  implemented.** The wire *format* is faithful to the spec (schema
+  fast-pathed via the existing Names/Class attributes, one extra
+  RowCount field), but both sides still buffer the whole encoded value
+  in memory (`ArrayBufferWriter` in C#, `rawConnection` in R) before
+  it goes out over the wire. This is the single biggest gap between
+  what's implemented and what spec.md originally described as the
+  point of designing TABLE at all — see "Current phase" above for the
+  full reasoning and what changing it would require.
+
+- **`ProcessSupervisor` now depends on `IRChannelListener`, not a
+  concrete `TcpListener`, for the connection-establishment side of the
+  channel abstraction.** Phase 1 already made the post-connection data
+  channel pluggable via `IRChannel`; this closes the equivalent gap on
+  the "how do we get connected in the first place" side. Not something
+  the original phase plans called for explicitly, but a direct,
+  correct extension of the same channel-agnostic principle spec.md
+  section 2.1 already established.
+
+- **Async stdio pump tasks replace the `BeginOutputReadLine`/
+  `OutputDataReceived` event pattern.** Not a spec.md decision, but a
+  concrete fix: `Dispose()` can now deterministically await both
+  streams fully draining (with a timeout) rather than a test needing
+  to guess a delay long enough for the old event-based mechanism to
+  have caught up.
+
+- **`RErrorException` carries structured `Classes`/`Call` fields, not
+  just a message.** The error was already sent as a real object over
+  the wire protocol before this change (never inferred from stdout/
+  stderr) — this made that object more useful, matching what a real R
+  condition actually carries.
+
 ## Notes / blockers
 
-- Phase 1's code **builds successfully** (confirmed on a real machine).
-  Its tests have not been confirmed passing yet.
-- Phases 2 and 3's code has **not been built at all**. Build order:
-  1. `dotnet build` — Phase 3 touched `Call`/`CallAsync`'s public
-     signature (now `IReadOnlyList<RCallArgument>`), so a Phase 2-only
-     partial build isn't meaningful; build everything together.
-  2. `RValueCodecTests` (pure C#) — as before, run
-     `Double_NaReal_And_ComputedNaN_StayDistinct_AfterRoundTrip` first.
-  3. `EvalCallIntegrationTests` and `HandleLifecycleTests` (need
-     `Rscript`) — `HandleLifecycleTests` depends on `EvalAsync` working
-     correctly (it uses `EvalAsync("exists(...)")` as a diagnostic
-     probe into the R-side registry), so if `EvalCallIntegrationTests`
-     is failing, fix that before debugging `HandleLifecycleTests`.
-- `worker.R`'s registry functions (`rwire_registry_*`) have not been
-  checked against a real R interpreter. The riskiest assumption:
-  `assign()`/`get()` on a `list(value=..., refcount=..., last_touched=...)`
-  stored by string key in an `environment()` — this is a standard R
-  pattern but hasn't been exercised here. If `HandleLifecycleTests`
-  fails oddly, check this before suspecting the wire protocol.
+- **This is the first phase where real `dotnet build`/`dotnet test`
+  output (not just code review) drove changes** - three concrete bugs
+  were found and fixed this way (see "Current phase" above). Treat
+  this as evidence the earlier "builds successfully" status for
+  Phase 1 meant exactly that and no more - compiling clean does not
+  mean behaviorally correct, and the same is almost certainly true of
+  Phases 2-4's code below, which has not been run at all yet.
+- Phases 2, 3, and 4's code (including everything added in this
+  hardening pass) has **not been built or run**. Build order:
+  1. `dotnet build` - the `RCallArgument` signature change, the new
+     `IRChannelListener` constructor parameter, the `RErrorException`
+     constructor signature change (now 3 args, was 1), and the new
+     `AwesomeAssertions` package reference are all recent enough that
+     a clean build isn't a given; check the test project resolves the
+     new package first if restore is slow/fails.
+  2. `RValueCodecTests` and `FrameCodecTests`/`RConnectionTests` (pure
+     C#, no R) - as before, run
+     `Double_NaReal_And_ComputedNaN_StayDistinct_AfterRoundTrip` first,
+     then the new `Table_*` tests.
+  3. `r/tests/testthat.R` (`Rscript tests/testthat.R` from the `r/`
+     directory, or `testthat::test_dir("tests/testthat")`) - pure R,
+     no C# process, and cheaper to debug than the integration tests if
+     something in `write_r_value`/`read_r_value`/the registry
+     functions is wrong. This is genuinely untested against a real R
+     interpreter as of this writing, including the guard added to
+     worker.R's final block (`getOption("rwire.testing")`) - if
+     `source()`-ing worker.R for tests doesn't behave as expected,
+     start here.
+  4. `EvalCallIntegrationTests`, `HandleLifecycleTests`,
+     `TablePerformanceTests` (need `Rscript`, share
+     `RWireProcessFixture`) - `HandleLifecycleTests` depends on
+     `EvalAsync` working (it uses `EvalAsync("exists(...)")` as a
+     diagnostic probe into the R-side registry), so fix
+     `EvalCallIntegrationTests` first if both are failing.
+  5. `ProcessSupervisorTests` (needs `Rscript`, own isolated processes,
+     not the shared fixture) - this is where the three bug fixes above
+     should actually be re-verified against real output, since they
+     were fixed from a description of a failure, not by re-running
+     the fixed code.
+- **The `EnsureReady` fix (allowing `Busy` through) has not been
+  re-tested.** It's a small, logically clear change, but the original
+  failure came from a real concurrency race - re-run
+  `HandleLifecycleTests.Dispose_ReleasesTheHandle_FromTheRSideRegistry`
+  specifically (ideally a few times, given it's timing-sensitive) 
+  before trusting the fix.
+- `worker.R`'s registry functions (`rwire_registry_*`) still haven't
+  been checked against a real R interpreter directly - `testthat`
+  now gives a cheap way to do that (`test-registry.R`) without needing
+  the full C# integration path; use it first if something here seems
+  wrong.
 - The `HandleLifecycleTests` tests that poll for the background
   `ReleaseHandleBestEffort` `Task.Run` to complete
   (`Dispose_ReleasesTheHandle_FromTheRSideRegistry`,
   `TwoHandlesViaCreateRef_BothMustBeDisposed_BeforeObjectIsFreed`) have
-  a real timing dependency (polling with a 2-second deadline) — if
-  these are flaky on a slow machine, that's a test tuning issue, not
-  necessarily a correctness bug; check the non-timing assertions in
-  the same test first.
-- `worker.R`'s frame *and* RValue *and* now registry/handle-ID wire
-  shape are still hand-kept in sync with the C# side across three
-  files (`MsgType.cs`/`RTypeTag.cs`/`RValueCodec.cs`) and this doc's
-  own description of the handle ID encoding. This is the same
-  no-shared-source-of-truth risk flagged after Phase 2, now with more
-  surface area.
+  a real timing dependency - if these are flaky on a slow machine,
+  that's a test-tuning issue, not necessarily a correctness bug; check
+  the non-timing assertions in the same test first.
+- `worker.R`'s frame, RValue, Table, and registry/handle-ID wire shape
+  are all still hand-kept in sync with the C# side across several
+  files (`MsgType.cs`/`RTypeTag.cs`/`RValueCodec.cs`/`RValue.cs`) and
+  this doc's own description of each. This surface has grown
+  significantly across Phases 2-4 with no shared source of truth
+  between the two languages - still worth codegen if a future phase
+  has room for it.
+- `TablePerformanceTests`' logged timings are exactly that - logged,
+  not asserted against a threshold. Don't read a passing test run as
+  a performance claim; read the numbers in the test output once you
+  have a real machine to run them on, and remember Phase 4's
+  known-buffered (not streamed) implementation means today's numbers
+  aren't representative of what the design is ultimately meant to
+  achieve.

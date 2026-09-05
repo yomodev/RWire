@@ -40,6 +40,13 @@ public sealed class RValue
     /// <summary>List: an arbitrary sequence of independently-typed RValues.</summary>
     public RValue[]? ListValues { get; init; }
 
+    /// <summary>
+    /// Row count for a Table (TypeTag == Table). Every entry in
+    /// ListValues (the table's columns) must have exactly this many
+    /// elements - docs/spec.md section 6.
+    /// </summary>
+    public int? RowCount { get; init; }
+
     /// <summary>Element names, if any (an empty string means "unnamed", per R's own convention).</summary>
     public string?[]? Names { get; init; }
 
@@ -61,6 +68,7 @@ public sealed class RValue
         RTypeTag.Character => CharacterValues?.Length ?? 0,
         RTypeTag.Raw => RawValues?.Length ?? 0,
         RTypeTag.List => ListValues?.Length ?? 0,
+        RTypeTag.Table => ListValues?.Length ?? 0, // column count, matching Names' column-name count
         _ => 0,
     };
 
@@ -71,4 +79,83 @@ public sealed class RValue
     public static RValue OfCharacter(string?[] values) => new() { TypeTag = RTypeTag.Character, CharacterValues = values };
     public static RValue OfRaw(byte[] values) => new() { TypeTag = RTypeTag.Raw, RawValues = values };
     public static RValue OfList(RValue[] values) => new() { TypeTag = RTypeTag.List, ListValues = values };
+
+    /// <summary>
+    /// Builds a Table RValue from named columns - the row count is
+    /// taken from the first column and every other column is
+    /// validated to match (throws ArgumentException on mismatch, a
+    /// programmer error on the encode side; the decode side has its
+    /// own InvalidDataException check for the equivalent wire-level
+    /// corruption case - see RValueCodec).
+    /// </summary>
+    public static RValue OfTable(IReadOnlyList<(string Name, RValue Column)> columns, string[]? classNames = null)
+    {
+        int rowCount = columns.Count > 0 ? columns[0].Column.Length : 0;
+        var values = new RValue[columns.Count];
+        var names = new string?[columns.Count];
+
+        for (int i = 0; i < columns.Count; i++)
+        {
+            if (columns[i].Column.Length != rowCount)
+            {
+                throw new ArgumentException(
+                    $"Column '{columns[i].Name}' has length {columns[i].Column.Length}, " +
+                    $"expected {rowCount} (taken from the first column).",
+                    nameof(columns));
+            }
+
+            values[i] = columns[i].Column;
+            names[i] = columns[i].Name;
+        }
+
+        return new RValue
+        {
+            TypeTag = RTypeTag.Table,
+            RowCount = rowCount,
+            ListValues = values,
+            Names = names,
+            Class = classNames ?? new[] { "data.frame" },
+        };
+    }
+
+    /// <summary>
+    /// Decode-side table construction: validates each column's length
+    /// against the declared row count and throws InvalidDataException
+    /// (not ArgumentException) on mismatch, since a failure here means
+    /// the wire data itself is corrupt or desynced, not a caller
+    /// mistake. Names/Class are attached afterward by
+    /// RValueCodec.ReadAttributes, same as every other type.
+    /// </summary>
+    internal static RValue FromWireTable(int rowCount, RValue[] columns)
+    {
+        foreach (RValue column in columns)
+        {
+            if (column.Length != rowCount)
+            {
+                throw new InvalidDataException(
+                    $"Table column length {column.Length} does not match declared RowCount " +
+                    $"{rowCount} - stream is desynced or corrupt.");
+            }
+        }
+
+        return new RValue { TypeTag = RTypeTag.Table, RowCount = rowCount, ListValues = columns };
+    }
+
+    /// <summary>Convenience accessor for a Table's columns by name (falls back to "V1", "V2", ... for unnamed columns).</summary>
+    public IReadOnlyDictionary<string, RValue> GetTableColumns()
+    {
+        if (TypeTag != RTypeTag.Table)
+        {
+            throw new InvalidOperationException($"GetTableColumns() requires TypeTag.Table, this value is {TypeTag}.");
+        }
+
+        var result = new Dictionary<string, RValue>(ListValues!.Length);
+        for (int i = 0; i < ListValues.Length; i++)
+        {
+            string name = Names?[i] ?? $"V{i + 1}";
+            result[name] = ListValues[i];
+        }
+
+        return result;
+    }
 }

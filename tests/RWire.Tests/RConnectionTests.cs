@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using AwesomeAssertions;
 using Xunit;
 
 namespace RWire.Tests;
@@ -55,9 +56,9 @@ public class RConnectionTests : IAsyncLifetime
 
         using Frame received = server.Receive();
 
-        Assert.Equal(MsgType.Eval, received.MsgType);
-        Assert.Equal(3u, received.CorrelationId);
-        Assert.Equal(payload, received.Payload.ToArray());
+        received.MsgType.Should().Be(MsgType.Eval);
+        received.CorrelationId.Should().Be(3u);
+        received.Payload.ToArray().Should().Equal(payload);
     }
 
     [Fact]
@@ -70,9 +71,9 @@ public class RConnectionTests : IAsyncLifetime
 
         using Frame received = await server.ReceiveAsync();
 
-        Assert.Equal(MsgType.Call, received.MsgType);
-        Assert.Equal(9u, received.CorrelationId);
-        Assert.Equal(payload, received.Payload.ToArray());
+        received.MsgType.Should().Be(MsgType.Call);
+        received.CorrelationId.Should().Be(9u);
+        received.Payload.ToArray().Should().Equal(payload);
     }
 
     [Fact]
@@ -84,8 +85,8 @@ public class RConnectionTests : IAsyncLifetime
 
         using Frame received = server.Receive();
 
-        Assert.Equal(MsgType.Ping, received.MsgType);
-        Assert.Equal(0, received.Payload.Length);
+        received.MsgType.Should().Be(MsgType.Ping);
+        received.Payload.Length.Should().Be(0);
     }
 
     [Fact]
@@ -95,7 +96,9 @@ public class RConnectionTests : IAsyncLifetime
 
         client.Dispose(); // closes the underlying socket
 
-        Assert.Throws<EndOfStreamException>(() => server.Receive());
+        Action act = () => server.Receive();
+
+        act.Should().Throw<EndOfStreamException>();
     }
 
     [Fact]
@@ -106,7 +109,7 @@ public class RConnectionTests : IAsyncLifetime
         uint first = connection.NextCorrelationId();
         uint second = connection.NextCorrelationId();
 
-        Assert.NotEqual(0u, first);
-        Assert.Equal(first + 1, second);
+        first.Should().NotBe(0u);
+        second.Should().Be(first + 1);
     }
 }

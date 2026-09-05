@@ -1,8 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.Net;
-using System.Net.Sockets;
 using System.Text;
 
 namespace RWire;
@@ -75,13 +73,15 @@ public sealed class ProcessSupervisor : IDisposable
 
     private readonly RWireOptions _options;
     private readonly Process _process;
-    private readonly TcpListener _listener;
+    private readonly IRChannelListener _channelListener;
     private readonly string _token;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
 
     private RConnection? _connection;
     private CancellationTokenSource? _heartbeatCts;
     private Task? _heartbeatLoopTask;
+    private Task? _stdoutPumpTask;
+    private Task? _stderrPumpTask;
     private bool _disposed;
 
     public SupervisorState State { get; private set; } = SupervisorState.NotStarted;
@@ -98,15 +98,30 @@ public sealed class ProcessSupervisor : IDisposable
     /// </summary>
     public ulong SessionId { get; } = (ulong)Interlocked.Increment(ref _nextSessionId);
 
-    /// <summary>The ephemeral loopback port the R process was told to connect back to.</summary>
+    /// <summary>The ephemeral loopback port (or other listener-defined value) the R process was told to connect back to.</summary>
     public int Port { get; }
 
     /// <summary>The R version string reported in the HELLO frame, populated after StartAsync completes.</summary>
     public string? RVersion { get; private set; }
 
     /// <summary>
+    /// The process's exit code, populated once Dispose has confirmed
+    /// the process has actually exited. Null before that. Exists so
+    /// callers/tests can check exit status without touching the
+    /// underlying Process object after Dispose has released it -
+    /// Process throws InvalidOperationException ("No process is
+    /// associated with this object") if its properties are accessed
+    /// post-Dispose, so this is captured proactively instead.
+    /// </summary>
+    public int? ExitCode { get; private set; }
+
+    /// <summary>
     /// Raised for every line the R process writes to stdout or
-    /// stderr. isError is true for stderr lines. Phase 6 adds
+    /// stderr. isError is true for stderr lines. Read via two
+    /// dedicated async ReadLineAsync loops (not the
+    /// BeginOutputReadLine/OutputDataReceived event pattern) so
+    /// Dispose can deterministically await both streams draining
+    /// fully rather than guessing with a fixed delay. Phase 6 adds
     /// fatal-signature scanning as a secondary crash-detection signal
     /// on top of this.
     /// </summary>
@@ -115,14 +130,23 @@ public sealed class ProcessSupervisor : IDisposable
     /// <summary>Exposed for test purposes only (see AssemblyInfo.cs's InternalsVisibleTo).</summary>
     internal Process ProcessForTesting => _process;
 
-    public ProcessSupervisor(RWireOptions options)
+    /// <summary>Uses the default TCP loopback channel listener.</summary>
+    public ProcessSupervisor(RWireOptions options) : this(options, new TcpRChannelListener())
+    {
+    }
+
+    /// <summary>
+    /// Uses the given channel listener instead of the default TCP one -
+    /// the extension point for tests or for a future non-socket
+    /// channel. ProcessSupervisor never constructs a TcpListener/
+    /// TcpClient itself; it only depends on IRChannelListener.
+    /// </summary>
+    public ProcessSupervisor(RWireOptions options, IRChannelListener channelListener)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _channelListener = channelListener ?? throw new ArgumentNullException(nameof(channelListener));
         _token = Guid.NewGuid().ToString("N");
-
-        _listener = new TcpListener(IPAddress.Loopback, 0);
-        _listener.Start();
-        Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+        Port = _channelListener.Port;
 
         var startInfo = new ProcessStartInfo
         {
@@ -138,20 +162,6 @@ public sealed class ProcessSupervisor : IDisposable
         startInfo.ArgumentList.Add($"--token={_token}");
 
         _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        _process.OutputDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                DiagnosticOutput?.Invoke(e.Data, false);
-            }
-        };
-        _process.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                DiagnosticOutput?.Invoke(e.Data, true);
-            }
-        };
         _process.Exited += (_, _) =>
         {
             if (State is SupervisorState.Starting or SupervisorState.Ready or SupervisorState.Busy)
@@ -159,6 +169,23 @@ public sealed class ProcessSupervisor : IDisposable
                 State = SupervisorState.Faulted;
             }
         };
+    }
+
+    /// <summary>
+    /// Reads lines from reader and raises DiagnosticOutput for each,
+    /// until EOF (the process closed the stream, normally because it
+    /// exited). Runs as a background task started right after
+    /// Process.Start() so early output - including from a process
+    /// that fails almost immediately - is captured well before any
+    /// caller gets around to checking DiagnosticOutput.
+    /// </summary>
+    private async Task PumpStreamAsync(TextReader reader, bool isError)
+    {
+        string? line;
+        while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) is not null)
+        {
+            DiagnosticOutput?.Invoke(line, isError);
+        }
     }
 
     /// <summary>
@@ -195,17 +222,17 @@ public sealed class ProcessSupervisor : IDisposable
             throw new InvalidOperationException("Process.Start returned false.");
         }
 
-        _process.BeginOutputReadLine();
-        _process.BeginErrorReadLine();
+        _stdoutPumpTask = PumpStreamAsync(_process.StandardOutput, isError: false);
+        _stderrPumpTask = PumpStreamAsync(_process.StandardError, isError: true);
 
         using var timeoutCts = new CancellationTokenSource(_options.HandshakeTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, timeoutCts.Token);
 
-        TcpClient client;
+        IRChannel channel;
         try
         {
-            client = await _listener.AcceptTcpClientAsync(linkedCts.Token).ConfigureAwait(false);
+            channel = await _channelListener.AcceptAsync(linkedCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
@@ -215,7 +242,7 @@ public sealed class ProcessSupervisor : IDisposable
                 "to connect back. Check stderr via DiagnosticOutput for R-side errors.");
         }
 
-        _connection = new RConnection(new SocketRChannel(client));
+        _connection = new RConnection(channel);
 
         try
         {
@@ -332,12 +359,33 @@ public sealed class ProcessSupervisor : IDisposable
     // derived from the other (same principle as RConnection).
     // -----------------------------------------------------------------
 
+    /// <summary>
+    /// Rejects genuinely unusable states before a caller queues on
+    /// _connectionLock. Deliberately does NOT reject Busy: Busy means
+    /// "another call is currently using the connection", which is a
+    /// normal, transient condition for any concurrent caller to
+    /// observe - the connection lock below is what serializes actual
+    /// access, so a concurrent caller should queue and wait its turn,
+    /// not be thrown at just because it happened to check State while
+    /// someone else's request was in flight. Bug found via a real test
+    /// failure (a background handle-release racing a foreground EVAL
+    /// diagnostic call): treating Busy as a rejection meant a
+    /// perfectly valid, merely-waiting request got turned away.
+    /// </summary>
     private void EnsureReady()
     {
-        if (State != SupervisorState.Ready)
+        switch (State)
         {
-            throw new InvalidOperationException(
-                $"Cannot make a call while in state {State} (must be Ready).");
+            case SupervisorState.Ready:
+            case SupervisorState.Busy:
+                return;
+            case SupervisorState.Faulted:
+                throw new InvalidOperationException("Cannot make a call: the connection is Faulted.");
+            case SupervisorState.Disposed:
+                throw new ObjectDisposedException(nameof(ProcessSupervisor));
+            default:
+                throw new InvalidOperationException(
+                    $"Cannot make a call before StartAsync has completed (current state: {State}).");
         }
     }
 
@@ -808,8 +856,7 @@ public sealed class ProcessSupervisor : IDisposable
     {
         if (response.MsgType == MsgType.Error)
         {
-            int offset = 0;
-            throw new RErrorException(WireStrings.Read(response.Payload.Span, ref offset));
+            throw DecodeError(response.Payload.Span);
         }
 
         if (response.MsgType != MsgType.Result || response.Payload.Length != 8)
@@ -826,8 +873,7 @@ public sealed class ProcessSupervisor : IDisposable
     {
         if (response.MsgType == MsgType.Error)
         {
-            int offset = 0;
-            throw new RErrorException(WireStrings.Read(response.Payload.Span, ref offset));
+            throw DecodeError(response.Payload.Span);
         }
 
         if (response.MsgType != MsgType.Result)
@@ -878,8 +924,7 @@ public sealed class ProcessSupervisor : IDisposable
     {
         if (response.MsgType == MsgType.Error)
         {
-            int offset = 0;
-            throw new RErrorException(WireStrings.Read(response.Payload.Span, ref offset));
+            throw DecodeError(response.Payload.Span);
         }
 
         if (response.MsgType != MsgType.Result)
@@ -889,6 +934,39 @@ public sealed class ProcessSupervisor : IDisposable
         }
 
         return RValueCodec.Decode(response.Payload.Span);
+    }
+
+    /// <summary>
+    /// Decodes an ERROR frame's payload into an RErrorException.
+    /// Wire shape (docs/spec.md section 4.2, ERROR):
+    ///   [Message: Len(4)+UTF8] [ClassCount(4)] {Len(4)+UTF8}*ClassCount [HasCall(1)] [Call: Len(4)+UTF8]?
+    /// This is a structured object sent over the protocol itself, not
+    /// something inferred from stdout/stderr - the connection's data
+    /// channel and the diagnostic-logging channel are deliberately
+    /// separate (docs/spec.md section 2), and relying on stdout/stderr
+    /// to communicate a specific request's failure back to the caller
+    /// that made it would be fragile (ordering isn't guaranteed to
+    /// line up with which request caused it, and there is nothing
+    /// stopping arbitrary R code from writing to stdout/stderr itself).
+    /// </summary>
+    private static RErrorException DecodeError(ReadOnlySpan<byte> payload)
+    {
+        int offset = 0;
+        string message = WireStrings.Read(payload, ref offset);
+
+        int classCount = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(offset, 4));
+        offset += 4;
+        var classes = new string[classCount];
+        for (int i = 0; i < classCount; i++)
+        {
+            classes[i] = WireStrings.Read(payload, ref offset);
+        }
+
+        byte hasCall = payload[offset];
+        offset += 1;
+        string? call = hasCall == 1 ? WireStrings.Read(payload, ref offset) : null;
+
+        return new RErrorException(message, classes, call);
     }
 
     /// <summary>
@@ -932,7 +1010,7 @@ public sealed class ProcessSupervisor : IDisposable
 
         try
         {
-            _listener.Stop();
+            _channelListener.Dispose();
         }
         catch
         {
@@ -949,6 +1027,13 @@ public sealed class ProcessSupervisor : IDisposable
                     _process.WaitForExit();
                 }
             }
+
+            // Captured now, before _process.Dispose() below - Process
+            // throws "No process is associated with this object" if
+            // its properties are read after Dispose, so anything a
+            // caller might want to inspect post-Dispose (here, just
+            // the exit code) must be pulled out proactively.
+            ExitCode = _process.ExitCode;
         }
         catch
         {
@@ -962,6 +1047,30 @@ public sealed class ProcessSupervisor : IDisposable
         catch
         {
             // Best-effort - the CancellationTokenSource above already asked it to stop.
+        }
+
+        // The process has exited by this point (or was force-killed
+        // above), so stdout/stderr are closed and these pump tasks
+        // should complete almost immediately - awaiting them here
+        // means DiagnosticOutput has definitely seen every line by the
+        // time Dispose returns, rather than a caller having to guess
+        // with an arbitrary delay.
+        try
+        {
+            _stdoutPumpTask?.Wait(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // Best-effort.
+        }
+
+        try
+        {
+            _stderrPumpTask?.Wait(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // Best-effort.
         }
 
         _heartbeatCts?.Dispose();

@@ -12,4 +12,5 @@ public enum RTypeTag : byte
     Character = 4,
     Raw = 5,
     List = 6,
+    Table = 7,
 }

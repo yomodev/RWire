@@ -1,29 +1,26 @@
+using AwesomeAssertions;
 using Xunit;
 
 namespace RWire.Tests;
 
 /// <summary>
-/// Phase 3 handle lifecycle tests (docs/spec.md section 12.4 /
-/// docs/phases/phase-3-reference-counting.md's exit criteria).
+/// Phase 3 handle lifecycle tests (docs/spec.md section 12.4). Uses
+/// the shared RWireProcessFixture for the "first" supervisor in every
+/// test - none of these tests dispose or otherwise disrupt the shared
+/// process's lifecycle, they only create/release handles against it.
+/// The session-mismatch test still spins up its own second,
+/// independent ProcessSupervisor, since testing cross-session
+/// rejection requires a genuinely different session by definition.
 /// Requires a real R installation with Rscript on PATH.
 /// </summary>
-public class HandleLifecycleTests : IAsyncLifetime
+[Collection(nameof(RWireProcessCollection))]
+public class HandleLifecycleTests
 {
-    private ProcessSupervisor _supervisor = null!;
+    private readonly ProcessSupervisor _supervisor;
 
-    private static string WorkerScriptPath =>
-        Path.Combine(AppContext.BaseDirectory, "r", "worker.R");
-
-    public async Task InitializeAsync()
+    public HandleLifecycleTests(RWireProcessFixture fixture)
     {
-        _supervisor = new ProcessSupervisor(new RWireOptions { WorkerScriptPath = WorkerScriptPath });
-        await _supervisor.StartAsync();
-    }
-
-    public Task DisposeAsync()
-    {
-        _supervisor.Dispose();
-        return Task.CompletedTask;
+        _supervisor = fixture.Supervisor;
     }
 
     /// <summary>Confirms the R-side registry no longer has an entry for id, via a diagnostic EVAL against the registry environment.</summary>
@@ -41,24 +38,27 @@ public class HandleLifecycleTests : IAsyncLifetime
 
         RValue result = await _supervisor.GetObjAsync(handle);
 
-        Assert.Equal(new[] { 1, 2, 3 }, result.IntegerValues);
+        result.IntegerValues.Should().Equal(1, 2, 3);
     }
 
     [Fact]
     public async Task Dispose_ReleasesTheHandle_FromTheRSideRegistry()
     {
         RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
-
-        // Grab the id before Dispose invalidates handle.Id.
-        long id = await GetHandleIdViaReflectionWorkaroundAsync(handle);
+        long id = handle.Id;
 
         handle.Dispose();
 
-        // ReleaseHandleBestEffort fires a background Task.Run - give it
-        // a moment to complete before checking the registry.
-        await WaitUntilAsync(() => RegistryContainsAsync(id).GetAwaiter().GetResult() == false);
+        // ReleaseHandleBestEffort fires a background Task.Run - poll
+        // rather than assume it's finished immediately. This relies on
+        // EnsureReady() allowing a concurrent EvalAsync call to queue
+        // on the connection lock instead of throwing while the
+        // background release happens to be Busy - see
+        // docs/progress.md's "Decisions changed since spec.md" for
+        // that fix.
+        await WaitUntilAsync(async () => !await RegistryContainsAsync(id));
 
-        Assert.False(await RegistryContainsAsync(id));
+        (await RegistryContainsAsync(id)).Should().BeFalse();
     }
 
     [Fact]
@@ -67,31 +67,31 @@ public class HandleLifecycleTests : IAsyncLifetime
         RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
         handle.Dispose();
 
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => _supervisor.GetObjAsync(handle));
+        Func<Task> act = () => _supervisor.GetObjAsync(handle);
+
+        await act.Should().ThrowAsync<ObjectDisposedException>();
     }
 
     [Fact]
     public async Task TwoHandlesViaCreateRef_BothMustBeDisposed_BeforeObjectIsFreed()
     {
         RHandle first = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 42.0 }));
-        long id = await GetHandleIdViaReflectionWorkaroundAsync(first);
+        long id = first.Id;
         RHandle second = await _supervisor.CreateRefAsync(first);
 
         first.Dispose();
-        await Task.Delay(200); // let the background release complete
+        await WaitUntilAsync(() => Task.FromResult(true), timeoutMs: 200); // let the background release attempt run
 
-        Assert.True(
-            await RegistryContainsAsync(id),
-            "Object should still be registered - the second handle's reference is still live.");
+        (await RegistryContainsAsync(id)).Should().BeTrue(
+            "the object should still be registered - the second handle's reference is still live");
 
-        // Still usable via the second handle.
         RValue result = await _supervisor.GetObjAsync(second);
-        Assert.Equal(42.0, result.DoubleValues![0]);
+        result.DoubleValues![0].Should().Be(42.0);
 
         second.Dispose();
-        await WaitUntilAsync(() => RegistryContainsAsync(id).GetAwaiter().GetResult() == false);
+        await WaitUntilAsync(async () => !await RegistryContainsAsync(id));
 
-        Assert.False(await RegistryContainsAsync(id));
+        (await RegistryContainsAsync(id)).Should().BeFalse();
     }
 
     [Fact]
@@ -101,12 +101,14 @@ public class HandleLifecycleTests : IAsyncLifetime
         // the second call must not throw (docs/progress.md: double
         // release is a no-op by design, not a protocol error).
         RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
-        long id = await GetHandleIdViaReflectionWorkaroundAsync(handle);
+        long id = handle.Id;
 
         await _supervisor.ReleaseRefAsync(id);
-        await _supervisor.ReleaseRefAsync(id); // should not throw
 
-        Assert.Equal(SupervisorState.Ready, _supervisor.State);
+        Func<Task> secondRelease = () => _supervisor.ReleaseRefAsync(id);
+        await secondRelease.Should().NotThrowAsync();
+
+        _supervisor.State.Should().Be(SupervisorState.Ready);
     }
 
     [Fact]
@@ -121,27 +123,23 @@ public class HandleLifecycleTests : IAsyncLifetime
         RHandle handleFromFirstSession = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
 
         using var secondSupervisor = new ProcessSupervisor(
-            new RWireOptions { WorkerScriptPath = WorkerScriptPath });
+            new RWireOptions { WorkerScriptPath = RWireProcessFixture.WorkerScriptPath });
         await secondSupervisor.StartAsync();
 
-        await Assert.ThrowsAsync<ObjectDisposedException>(
-            () => secondSupervisor.GetObjAsync(handleFromFirstSession));
+        Func<Task> act = () => secondSupervisor.GetObjAsync(handleFromFirstSession);
+
+        await act.Should().ThrowAsync<ObjectDisposedException>();
     }
 
-    /// <summary>
-    /// RHandle.Id is internal by design (not meant for application
-    /// code) - tests reach it via InternalsVisibleTo rather than
-    /// reflection; the "workaround" name just flags that this is
-    /// test-only plumbing, not a suggestion to expose Id publicly.
-    /// </summary>
-    private static Task<long> GetHandleIdViaReflectionWorkaroundAsync(RHandle handle) =>
-        Task.FromResult(handle.Id);
-
-    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 2000)
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, int timeoutMs = 2000)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(timeoutMs);
-        while (!condition() && DateTime.UtcNow < deadline)
+        while (DateTime.UtcNow < deadline)
         {
+            if (await condition())
+            {
+                return;
+            }
             await Task.Delay(50);
         }
     }

@@ -1,11 +1,12 @@
 using System.Buffers;
+using AwesomeAssertions;
 using Xunit;
 
 namespace RWire.Tests;
 
 /// <summary>
-/// Pure unit tests for RValueCodec (docs/spec.md section 12.1) - no R
-/// process involved. The NaN-vs-NA distinction test is the single
+/// Pure unit tests for RValueCodec (docs/spec.md sections 5, 6, 12.1) -
+/// no R process involved. The NaN-vs-NA distinction test is the single
 /// highest-priority test in this file per
 /// docs/phases/phase-2-atomic-types.md's "Notes for resuming
 /// mid-phase" - run it first if picking this back up.
@@ -23,7 +24,7 @@ public class RValueCodecTests
     public void Null_RoundTrips()
     {
         RValue result = RoundTrip(RValue.Null());
-        Assert.Equal(RTypeTag.Null, result.TypeTag);
+        result.TypeTag.Should().Be(RTypeTag.Null);
     }
 
     [Fact]
@@ -34,27 +35,27 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(RValue.OfDouble(input));
 
-        Assert.Equal(RTypeTag.Double, result.TypeTag);
+        result.TypeTag.Should().Be(RTypeTag.Double);
         double[] decoded = result.DoubleValues!;
 
-        Assert.Equal(1.5, decoded[0]);
-        Assert.True(RNumeric.IsNaReal(decoded[1]), "Element 1 should decode as R's NA_real_.");
-        Assert.False(RNumeric.IsNaReal(decoded[2]), "Element 2 is a computed NaN, not NA - must not collapse to NA.");
-        Assert.True(double.IsNaN(decoded[2]), "Element 2 should still be NaN, just not the NA variant.");
-        Assert.Equal(-2.25, decoded[3]);
+        decoded[0].Should().Be(1.5);
+        RNumeric.IsNaReal(decoded[1]).Should().BeTrue("element 1 should decode as R's NA_real_");
+        RNumeric.IsNaReal(decoded[2]).Should().BeFalse("element 2 is a computed NaN, not NA - must not collapse to NA");
+        double.IsNaN(decoded[2]).Should().BeTrue("element 2 should still be NaN, just not the NA variant");
+        decoded[3].Should().Be(-2.25);
 
         double?[] nullable = decoded.ToNullableArray();
-        Assert.Equal(1.5, nullable[0]);
-        Assert.Null(nullable[1]);
-        Assert.NotNull(nullable[2]); // a computed NaN is a value, not absence of one
-        Assert.Equal(-2.25, nullable[3]);
+        nullable[0].Should().Be(1.5);
+        nullable[1].Should().BeNull();
+        nullable[2].Should().NotBeNull("a computed NaN is a value, not absence of one");
+        nullable[3].Should().Be(-2.25);
     }
 
     [Fact]
     public void Double_EmptyVector_RoundTrips()
     {
         RValue result = RoundTrip(RValue.OfDouble(Array.Empty<double>()));
-        Assert.Equal(0, result.Length);
+        result.Length.Should().Be(0);
     }
 
     [Fact]
@@ -64,9 +65,9 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(RValue.OfInteger(input));
 
-        Assert.Equal(input, result.IntegerValues);
+        result.IntegerValues.Should().Equal(input);
         int?[] nullable = result.IntegerValues!.ToNullableArray();
-        Assert.Equal(new int?[] { 1, null, -5, 0 }, nullable);
+        nullable.Should().Equal(new int?[] { 1, null, -5, 0 });
     }
 
     [Theory]
@@ -75,7 +76,7 @@ public class RValueCodecTests
     public void Logical_TrueFalse_RoundTrips(byte code, bool expected)
     {
         RValue result = RoundTrip(RValue.OfLogical(new[] { code }));
-        Assert.Equal(expected, result.LogicalCodes!.ToNullableArray()[0]);
+        result.LogicalCodes!.ToNullableArray()[0].Should().Be(expected);
     }
 
     [Fact]
@@ -85,7 +86,7 @@ public class RValueCodecTests
         RValue result = RoundTrip(RValue.OfLogical(input));
 
         bool?[] nullable = result.LogicalCodes!.ToNullableArray();
-        Assert.Equal(new bool?[] { true, null, false }, nullable);
+        nullable.Should().Equal(new bool?[] { true, null, false });
     }
 
     [Fact]
@@ -95,7 +96,7 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(RValue.OfCharacter(input));
 
-        Assert.Equal(input, result.CharacterValues);
+        result.CharacterValues.Should().Equal(input);
     }
 
     [Fact]
@@ -105,7 +106,7 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(RValue.OfCharacter(input));
 
-        Assert.Equal(input, result.CharacterValues);
+        result.CharacterValues.Should().Equal(input);
     }
 
     [Fact]
@@ -113,7 +114,7 @@ public class RValueCodecTests
     {
         byte[] input = { 0x00, 0xFF, 0x7F, 0x01 };
         RValue result = RoundTrip(RValue.OfRaw(input));
-        Assert.Equal(input, result.RawValues);
+        result.RawValues.Should().Equal(input);
     }
 
     [Fact]
@@ -128,8 +129,8 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(value);
 
-        Assert.Equal(new[] { 10, 20, 30 }, result.IntegerValues);
-        Assert.Equal(new string?[] { "a", "b", null }, result.Names);
+        result.IntegerValues.Should().Equal(10, 20, 30);
+        result.Names.Should().Equal(new string?[] { "a", "b", null });
     }
 
     [Fact]
@@ -144,7 +145,7 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(value);
 
-        Assert.Equal(new[] { 2, 3 }, result.Dim);
+        result.Dim.Should().Equal(2, 3);
     }
 
     [Fact]
@@ -161,9 +162,9 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(value);
 
-        Assert.Equal(new[] { "factor" }, result.Class);
-        Assert.Equal(new[] { 1, 3, 2 }, result.IntegerValues);
-        Assert.Equal(new string?[] { "low", "medium", "high" }, result.Attributes!["levels"].CharacterValues);
+        result.Class.Should().Equal("factor");
+        result.IntegerValues.Should().Equal(1, 3, 2);
+        result.Attributes!["levels"].CharacterValues.Should().Equal("low", "medium", "high");
     }
 
     [Fact]
@@ -178,17 +179,96 @@ public class RValueCodecTests
 
         RValue result = RoundTrip(value);
 
-        Assert.Equal(3, result.ListValues!.Length);
-        Assert.Equal(new[] { 1, 2 }, result.ListValues[0].IntegerValues);
-        Assert.Equal(new string?[] { "x", null }, result.ListValues[1].CharacterValues);
-        Assert.Equal(RTypeTag.Null, result.ListValues[2].TypeTag);
+        result.ListValues.Should().HaveCount(3);
+        result.ListValues![0].IntegerValues.Should().Equal(1, 2);
+        result.ListValues[1].CharacterValues.Should().Equal("x", null);
+        result.ListValues[2].TypeTag.Should().Be(RTypeTag.Null);
+    }
+
+    [Fact]
+    public void Table_RoundTrips_WithColumnsRowCountAndClass()
+    {
+        var value = RValue.OfTable(
+            new (string, RValue)[]
+            {
+                ("id", RValue.OfInteger(new[] { 1, 2, 3 })),
+                ("name", RValue.OfCharacter(new string?[] { "a", null, "c" })),
+                ("value", RValue.OfDouble(new double[] { 1.1, RNumeric.NaReal, 3.3 })),
+            },
+            classNames: new[] { "data.frame" });
+
+        RValue result = RoundTrip(value);
+
+        result.TypeTag.Should().Be(RTypeTag.Table);
+        result.RowCount.Should().Be(3);
+        result.Length.Should().Be(3, "Length is column count for a Table");
+        result.Class.Should().Equal("data.frame");
+        result.Names.Should().Equal(new string?[] { "id", "name", "value" });
+
+        IReadOnlyDictionary<string, RValue> columns = result.GetTableColumns();
+        columns["id"].IntegerValues.Should().Equal(1, 2, 3);
+        columns["name"].CharacterValues.Should().Equal("a", null, "c");
+        RNumeric.IsNaReal(columns["value"].DoubleValues![1]).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Table_ZeroColumns_RoundTrips()
+    {
+        RValue value = RValue.OfTable(Array.Empty<(string, RValue)>());
+
+        RValue result = RoundTrip(value);
+
+        result.TypeTag.Should().Be(RTypeTag.Table);
+        result.RowCount.Should().Be(0);
+        result.Length.Should().Be(0);
+    }
+
+    [Fact]
+    public void OfTable_ColumnLengthMismatch_ThrowsArgumentException()
+    {
+        Action act = () => RValue.OfTable(new (string, RValue)[]
+        {
+            ("a", RValue.OfInteger(new[] { 1, 2, 3 })),
+            ("b", RValue.OfInteger(new[] { 1, 2 })), // wrong length
+        });
+
+        act.Should().Throw<ArgumentException>();
+    }
+
+    [Fact]
+    public void Table_ListOfTables_RoundTrips()
+    {
+        RValue table1 = RValue.OfTable(new (string, RValue)[] { ("x", RValue.OfInteger(new[] { 1, 2 })) });
+        RValue table2 = RValue.OfTable(new (string, RValue)[] { ("x", RValue.OfInteger(new[] { 3, 4, 5 })) });
+        RValue list = RValue.OfList(new[] { table1, table2 });
+
+        RValue result = RoundTrip(list);
+
+        result.TypeTag.Should().Be(RTypeTag.List);
+        result.ListValues.Should().HaveCount(2);
+        result.ListValues![0].TypeTag.Should().Be(RTypeTag.Table);
+        result.ListValues[0].RowCount.Should().Be(2);
+        result.ListValues[1].RowCount.Should().Be(3);
+    }
+
+    [Fact]
+    public void GetTableColumns_OnNonTableValue_Throws()
+    {
+        RValue value = RValue.OfInteger(new[] { 1 });
+
+        Action act = () => value.GetTableColumns();
+
+        act.Should().Throw<InvalidOperationException>();
     }
 
     [Fact]
     public void Decode_UnknownTypeTag_Throws()
     {
         byte[] buffer = { 0xFF };
-        Assert.Throws<InvalidDataException>(() => RValueCodec.Decode(buffer));
+
+        Action act = () => RValueCodec.Decode(buffer);
+
+        act.Should().Throw<InvalidDataException>();
     }
 
     [Fact]
@@ -199,6 +279,45 @@ public class RValueCodecTests
 
         byte[] truncated = writer.WrittenSpan.ToArray()[..^2];
 
-        Assert.Throws<InvalidDataException>(() => RValueCodec.Decode(truncated));
+        Action act = () => RValueCodec.Decode(truncated);
+
+        act.Should().Throw<InvalidDataException>();
+    }
+
+    [Fact]
+    public void Decode_TableWithMismatchedColumnLength_ThrowsInvalidDataException()
+    {
+        // Hand-craft a corrupt Table frame: declares RowCount=5 but the
+        // single column only has 3 elements - simulates wire
+        // corruption/desync rather than going through OfTable's
+        // encode-side validation.
+        var manual = new ArrayBufferWriter<byte>();
+
+        // TypeTag=Table(7), RowCount=5, ColumnCount=1, column = Integer[1,2,3]
+        manual.GetSpan(1)[0] = (byte)RTypeTag.Table;
+        manual.Advance(1);
+        WriteInt32(manual, 5); // RowCount
+        WriteInt32(manual, 1); // ColumnCount
+
+        var columnWriter = new ArrayBufferWriter<byte>();
+        RValueCodec.Encode(columnWriter, RValue.OfInteger(new[] { 1, 2, 3 }));
+        manual.Write(columnWriter.WrittenSpan);
+
+        // Attribute flags: no names, no dim, no class, no generic attrs.
+        manual.GetSpan(1)[0] = 0; manual.Advance(1);
+        manual.GetSpan(1)[0] = 0; manual.Advance(1);
+        manual.GetSpan(1)[0] = 0; manual.Advance(1);
+        WriteInt32(manual, 0);
+
+        Action act = () => RValueCodec.Decode(manual.WrittenSpan);
+
+        act.Should().Throw<InvalidDataException>();
+    }
+
+    private static void WriteInt32(IBufferWriter<byte> writer, int value)
+    {
+        Span<byte> span = writer.GetSpan(4);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(span, value);
+        writer.Advance(4);
     }
 }

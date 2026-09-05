@@ -47,6 +47,7 @@ RTAG_DOUBLE    <- 3L
 RTAG_CHARACTER <- 4L
 RTAG_RAW       <- 5L
 RTAG_LIST      <- 6L
+RTAG_TABLE     <- 7L
 
 # ---- Low-level primitive read/write helpers ------------------------
 
@@ -243,6 +244,36 @@ write_r_value <- function(con, x) {
     return(invisible(NULL))
   }
 
+  if (is.data.frame(x)) {
+    write_byte_value(con, RTAG_TABLE)
+    write_int32(con, nrow(x))
+    write_int32(con, length(x))
+    for (col in x) write_r_value(con, col)
+
+    # Deliberately does NOT reuse write_attributes(): dim(x) for a
+    # data.frame invokes the dim.data.frame S3 *method* (computed on
+    # the fly from nrow/ncol), not a literal stored attribute -
+    # round-tripping that value through the generic attribute path
+    # would attach a spurious literal "dim" attribute when
+    # reconstructing the object on the other side. Tables get their
+    # own minimal names+class write instead - see docs/progress.md.
+    nm <- names(x)
+    if (!is.null(nm)) {
+      write_byte_value(con, 1L)
+      for (n in nm) write_length_prefixed_string(con, if (is.na(n)) "" else n)
+    } else {
+      write_byte_value(con, 0L)
+    }
+    write_byte_value(con, 0L) # no dim block for tables
+    cls <- class(x)
+    write_byte_value(con, 1L)
+    write_int32(con, length(cls))
+    for (c in cls) write_length_prefixed_string(con, c)
+    write_int32(con, 0L) # no generic attributes for tables (v1)
+
+    return(invisible(NULL))
+  }
+
   is_factor_value <- is.factor(x)
 
   if (is_factor_value) {
@@ -292,6 +323,11 @@ read_r_value <- function(con) {
     return(NULL)
   }
 
+  row_count <- NULL
+  if (tag == RTAG_TABLE) {
+    row_count <- read_int32(con)
+  }
+
   n <- read_int32(con)
 
   value <- if (tag == RTAG_LOGICAL) {
@@ -311,11 +347,40 @@ read_r_value <- function(con) {
     if (n > 0) readBin(con, what = "raw", n = n) else raw(0)
   } else if (tag == RTAG_LIST) {
     if (n == 0) list() else lapply(seq_len(n), function(i) read_r_value(con))
+  } else if (tag == RTAG_TABLE) {
+    columns <- if (n == 0) list() else lapply(seq_len(n), function(i) read_r_value(con))
+    for (col in columns) {
+      if (length(col) != row_count) {
+        stop(sprintf(
+          "Table column length %d does not match declared row count %d - stream is desynced or corrupt.",
+          length(col), row_count
+        ))
+      }
+    }
+    columns
   } else {
     stop(sprintf("read_r_value: unknown type tag %d", tag))
   }
 
-  read_attributes(con, value)
+  value <- read_attributes(con, value)
+
+  if (tag == RTAG_TABLE) {
+    # read_attributes() has already applied names(column names) and
+    # class ("data.frame"/c("data.table","data.frame")) generically.
+    # row.names still needs to be set explicitly - a data.frame isn't
+    # considered well-formed without one, and it isn't part of the
+    # generic attribute mechanism above (deliberately - see
+    # write_r_value's Table branch). attr<- (not row.names<-) is used
+    # to set it directly without going through data.frame's own
+    # validating S3 method, which isn't needed here since we're
+    # constructing the final, already-correct state directly.
+    attr(value, "row.names") <- seq_len(row_count)
+    if ("data.table" %in% class(value)) {
+      data.table::setDT(value)
+    }
+  }
+
+  value
 }
 
 # ---- Frame I/O (from Phase 1) ---------------------------------------
@@ -366,10 +431,48 @@ build_hello_payload <- function(token, r_version) {
   rawConnectionValue(con)
 }
 
-build_error_payload <- function(message_text) {
+#' Builds an ERROR frame payload as a structured object - message,
+#' condition classes, and the deparsed call, if any - rather than a
+#' bare string. This is sent over the protocol's data channel itself,
+#' never inferred from stdout/stderr: the diagnostic-logging channel
+#' (DiagnosticOutput on the C# side) and the data channel are
+#' deliberately separate (docs/spec.md section 2), and relying on
+#' stdout/stderr to communicate a specific request's failure back to
+#' its caller would be fragile - ordering isn't guaranteed to line up
+#' with which request caused it, and arbitrary R code can write to
+#' stdout/stderr for reasons that have nothing to do with an error.
+#'
+#' Accepts either a condition object (from a tryCatch handler) or a
+#' plain string (for protocol-level errors that aren't real R
+#' conditions, e.g. "message type not implemented") - a plain string
+#' is wrapped with simpleError() so both paths produce the same wire
+#' shape.
+#'
+#' Wire shape (must match ProcessSupervisor.DecodeError in
+#' src/RWire/ProcessSupervisor.cs):
+#'   [Message][ClassCount(4)]{Class}*[HasCall(1)][Call]?
+build_error_payload <- function(cond) {
+  if (is.character(cond)) {
+    cond <- simpleError(cond)
+  }
+
   con <- rawConnection(raw(0), "w")
   on.exit(close(con))
-  write_length_prefixed_string(con, message_text)
+
+  write_length_prefixed_string(con, conditionMessage(cond))
+
+  classes <- class(cond)
+  write_int32(con, length(classes))
+  for (cls_name in classes) write_length_prefixed_string(con, cls_name)
+
+  call_obj <- conditionCall(cond)
+  if (is.null(call_obj)) {
+    write_byte_value(con, 0L)
+  } else {
+    write_byte_value(con, 1L)
+    write_length_prefixed_string(con, paste(deparse(call_obj), collapse = " "))
+  }
+
   rawConnectionValue(con)
 }
 
@@ -676,7 +779,7 @@ main <- function(args) {
         # Non-fatal per-request error: report it, keep the loop alive.
         # This is the path spec.md section 12.5 calls out as
         # deliberately NOT triggering a supervisor restart.
-        error_payload <- build_error_payload(conditionMessage(e))
+        error_payload <- build_error_payload(e)
         write_frame(con, MSG_ERROR, frame$correlation_id, error_payload)
         invisible(NULL)
       }
@@ -688,10 +791,16 @@ main <- function(args) {
   }
 }
 
-tryCatch(
-  main(commandArgs(trailingOnly = TRUE)),
-  error = function(e) {
-    message(sprintf("worker.R fatal error: %s", conditionMessage(e)))
-    quit(status = 1, save = "no")
-  }
-)
+# Guarded so this script can be source()d (e.g. by testthat, to reuse
+# the function definitions above without launching a real worker) -
+# set options(rwire.testing = TRUE) before sourcing to skip this.
+# See r/tests/testthat/helper-source-worker.R.
+if (!isTRUE(getOption("rwire.testing", FALSE))) {
+  tryCatch(
+    main(commandArgs(trailingOnly = TRUE)),
+    error = function(e) {
+      message(sprintf("worker.R fatal error: %s", conditionMessage(e)))
+      quit(status = 1, save = "no")
+    }
+  )
+}

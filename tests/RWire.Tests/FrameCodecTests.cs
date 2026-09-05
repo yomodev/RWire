@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using AwesomeAssertions;
 using Xunit;
 
 namespace RWire.Tests;
@@ -23,20 +24,20 @@ public class FrameCodecTests
         byte[] buffer = new byte[total];
 
         int written = FrameCodec.EncodeFrame(buffer, msgType, correlationId: 7, payload);
-        Assert.Equal(total, written);
+        written.Should().Be(total);
 
         int bodyLength = FrameCodec.DecodeLengthPrefix(buffer.AsSpan(0, FrameCodec.LengthPrefixSize));
         (MsgType decodedMsgType, uint correlationId, int payloadLength) = FrameCodec.DecodeFixedHeader(
             buffer.AsSpan(FrameCodec.LengthPrefixSize, FrameCodec.FixedHeaderSize), bodyLength);
 
-        Assert.Equal(msgType, decodedMsgType);
-        Assert.Equal(7u, correlationId);
-        Assert.Equal(payload.Length, payloadLength);
+        decodedMsgType.Should().Be(msgType);
+        correlationId.Should().Be(7u);
+        payloadLength.Should().Be(payload.Length);
 
         byte[] decodedPayload = buffer
             .AsSpan(FrameCodec.LengthPrefixSize + FrameCodec.FixedHeaderSize, payloadLength)
             .ToArray();
-        Assert.Equal(payload, decodedPayload);
+        decodedPayload.Should().Equal(payload);
     }
 
     [Fact]
@@ -45,7 +46,9 @@ public class FrameCodecTests
         byte[] buffer = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(buffer, 3); // smaller than FixedHeaderSize (9)
 
-        Assert.Throws<InvalidDataException>(() => FrameCodec.DecodeLengthPrefix(buffer));
+        Action act = () => FrameCodec.DecodeLengthPrefix(buffer);
+
+        act.Should().Throw<InvalidDataException>();
     }
 
     [Fact]
@@ -56,8 +59,9 @@ public class FrameCodecTests
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(1), 1);
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(5), 0);
 
-        Assert.Throws<InvalidDataException>(
-            () => FrameCodec.DecodeFixedHeader(header, expectedBodyLength: FrameCodec.FixedHeaderSize));
+        Action act = () => FrameCodec.DecodeFixedHeader(header, expectedBodyLength: FrameCodec.FixedHeaderSize);
+
+        act.Should().Throw<InvalidDataException>();
     }
 
     [Fact]
@@ -69,8 +73,9 @@ public class FrameCodecTests
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(5), 100); // claims 100 payload bytes
 
         // expectedBodyLength says there's no payload at all - inconsistent.
-        Assert.Throws<InvalidDataException>(
-            () => FrameCodec.DecodeFixedHeader(header, expectedBodyLength: FrameCodec.FixedHeaderSize));
+        Action act = () => FrameCodec.DecodeFixedHeader(header, expectedBodyLength: FrameCodec.FixedHeaderSize);
+
+        act.Should().Throw<InvalidDataException>();
     }
 
     [Fact]
@@ -81,23 +86,24 @@ public class FrameCodecTests
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(1), 1);
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(5), -1);
 
-        Assert.Throws<InvalidDataException>(
-            () => FrameCodec.DecodeFixedHeader(header, expectedBodyLength: FrameCodec.FixedHeaderSize - 1));
+        Action act = () => FrameCodec.DecodeFixedHeader(header, expectedBodyLength: FrameCodec.FixedHeaderSize - 1);
+
+        act.Should().Throw<InvalidDataException>();
     }
 
     [Fact]
     public void EncodeFrame_DestinationTooSmall_Throws()
     {
         byte[] tooSmall = new byte[5];
-        Assert.Throws<ArgumentException>(
-            () => FrameCodec.EncodeFrame(tooSmall, MsgType.Ping, 1, new byte[10]));
+
+        Action act = () => FrameCodec.EncodeFrame(tooSmall, MsgType.Ping, 1, new byte[10]);
+
+        act.Should().Throw<ArgumentException>();
     }
 
     [Fact]
     public void TotalSize_MatchesLengthPrefixPlusFixedHeaderPlusPayload()
     {
-        Assert.Equal(
-            FrameCodec.LengthPrefixSize + FrameCodec.FixedHeaderSize + 42,
-            FrameCodec.TotalSize(42));
+        FrameCodec.TotalSize(42).Should().Be(FrameCodec.LengthPrefixSize + FrameCodec.FixedHeaderSize + 42);
     }
 }

@@ -44,7 +44,14 @@ public static class RValueCodec
             return;
         }
 
-        WriteInt32(writer, value.Length);
+        if (value.TypeTag == RTypeTag.Table)
+        {
+            WriteInt32(
+                writer,
+                value.RowCount ?? throw new InvalidOperationException("A Table RValue must have RowCount set."));
+        }
+
+        WriteInt32(writer, value.Length); // column count for Table, element count otherwise
 
         switch (value.TypeTag)
         {
@@ -78,8 +85,15 @@ public static class RValueCodec
                 break;
 
             case RTypeTag.List:
+            case RTypeTag.Table:
                 foreach (RValue element in value.ListValues!)
                 {
+                    if (value.TypeTag == RTypeTag.Table && element.Length != value.RowCount)
+                    {
+                        throw new InvalidOperationException(
+                            $"Table column length {element.Length} does not match RowCount {value.RowCount}.");
+                    }
+
                     Encode(writer, element);
                 }
                 break;
@@ -169,7 +183,13 @@ public static class RValueCodec
             return RValue.Null();
         }
 
-        int count = ReadInt32(buffer, ref offset);
+        int? rowCount = null;
+        if (typeTag == RTypeTag.Table)
+        {
+            rowCount = ReadInt32(buffer, ref offset);
+        }
+
+        int count = ReadInt32(buffer, ref offset); // column count for Table, element count otherwise
         if (count < 0)
         {
             throw new InvalidDataException($"Negative element count: {count}.");
@@ -183,6 +203,7 @@ public static class RValueCodec
             RTypeTag.Character => RValue.OfCharacter(ReadCharacterArray(buffer, ref offset, count)),
             RTypeTag.Raw => RValue.OfRaw(ReadBytes(buffer, ref offset, count)),
             RTypeTag.List => RValue.OfList(ReadList(buffer, ref offset, count)),
+            RTypeTag.Table => RValue.FromWireTable(rowCount!.Value, ReadList(buffer, ref offset, count)),
             _ => throw new NotSupportedException($"Unsupported RTypeTag: {typeTag}"),
         };
 
@@ -246,6 +267,7 @@ public static class RValueCodec
             CharacterValues = value.CharacterValues,
             RawValues = value.RawValues,
             ListValues = value.ListValues,
+            RowCount = value.RowCount,
             Names = names,
             Dim = dim,
             Class = cls,

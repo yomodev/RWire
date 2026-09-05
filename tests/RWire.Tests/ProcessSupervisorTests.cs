@@ -1,3 +1,4 @@
+using AwesomeAssertions;
 using Xunit;
 
 namespace RWire.Tests;
@@ -9,14 +10,16 @@ namespace RWire.Tests;
 ///     heartbeat interval
 ///   - SHUTDOWN results in clean process exit
 ///
-/// These require a real R installation with Rscript on PATH - they are
-/// integration tests, not unit tests (see FrameCodecTests/
-/// RConnectionTests for the unit-level protocol coverage).
+/// These deliberately do NOT use the shared RWireProcessFixture - each
+/// test here controls a full process lifecycle (including some that
+/// never successfully start), which the shared fixture is not
+/// compatible with. These require a real R installation with Rscript
+/// on PATH; see FrameCodecTests/RConnectionTests for the unit-level
+/// protocol coverage that doesn't.
 /// </summary>
 public class ProcessSupervisorTests
 {
-    private static string WorkerScriptPath =>
-        Path.Combine(AppContext.BaseDirectory, "r", "worker.R");
+    private static string WorkerScriptPath => RWireProcessFixture.WorkerScriptPath;
 
     private static RWireOptions FastHeartbeatOptions() => new()
     {
@@ -33,9 +36,9 @@ public class ProcessSupervisorTests
         using var supervisor = new ProcessSupervisor(options);
         await supervisor.StartAsync();
 
-        Assert.Equal(SupervisorState.Ready, supervisor.State);
-        Assert.True(supervisor.Port > 0);
-        Assert.False(string.IsNullOrWhiteSpace(supervisor.RVersion));
+        supervisor.State.Should().Be(SupervisorState.Ready);
+        supervisor.Port.Should().BePositive();
+        supervisor.RVersion.Should().NotBeNullOrWhiteSpace();
     }
 
     [Fact]
@@ -50,8 +53,10 @@ public class ProcessSupervisorTests
 
         using var supervisor = new ProcessSupervisor(options);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => supervisor.StartAsync());
-        Assert.Equal(SupervisorState.Faulted, supervisor.State);
+        Func<Task> act = () => supervisor.StartAsync();
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        supervisor.State.Should().Be(SupervisorState.Faulted);
     }
 
     [Fact]
@@ -65,8 +70,10 @@ public class ProcessSupervisorTests
 
         using var supervisor = new ProcessSupervisor(options);
 
-        await Assert.ThrowsAsync<TimeoutException>(() => supervisor.StartAsync());
-        Assert.Equal(SupervisorState.Faulted, supervisor.State);
+        Func<Task> act = () => supervisor.StartAsync();
+
+        await act.Should().ThrowAsync<TimeoutException>();
+        supervisor.State.Should().Be(SupervisorState.Faulted);
     }
 
     [Fact]
@@ -77,7 +84,7 @@ public class ProcessSupervisorTests
 
         await Task.Delay(TimeSpan.FromSeconds(1.5));
 
-        Assert.Equal(SupervisorState.Ready, supervisor.State);
+        supervisor.State.Should().Be(SupervisorState.Ready);
     }
 
     [Fact]
@@ -85,7 +92,7 @@ public class ProcessSupervisorTests
     {
         using var supervisor = new ProcessSupervisor(FastHeartbeatOptions());
         await supervisor.StartAsync();
-        Assert.Equal(SupervisorState.Ready, supervisor.State);
+        supervisor.State.Should().Be(SupervisorState.Ready);
 
         supervisor.ProcessForTesting.Kill(entireProcessTree: true);
 
@@ -95,7 +102,7 @@ public class ProcessSupervisorTests
             await Task.Delay(50);
         }
 
-        Assert.Equal(SupervisorState.Faulted, supervisor.State);
+        supervisor.State.Should().Be(SupervisorState.Faulted);
     }
 
     [Fact]
@@ -105,13 +112,15 @@ public class ProcessSupervisorTests
         var supervisor = new ProcessSupervisor(options);
         await supervisor.StartAsync();
 
-        System.Diagnostics.Process process = supervisor.ProcessForTesting;
-
         supervisor.Dispose();
 
-        Assert.True(process.HasExited);
-        Assert.Equal(0, process.ExitCode);
-        Assert.Equal(SupervisorState.Disposed, supervisor.State);
+        // ExitCode is captured by Dispose() before the underlying
+        // Process object is itself disposed - reading Process
+        // properties after Dispose throws ("No process is associated
+        // with this object"), so ProcessSupervisor surfaces the value
+        // proactively instead.
+        supervisor.ExitCode.Should().Be(0);
+        supervisor.State.Should().Be(SupervisorState.Disposed);
     }
 
     [Fact]
@@ -131,12 +140,20 @@ public class ProcessSupervisorTests
             if (isError) stderrLines.Add(line);
         };
 
-        await Assert.ThrowsAsync<TimeoutException>(() => supervisor.StartAsync());
+        Func<Task> act = () => supervisor.StartAsync();
+        await act.Should().ThrowAsync<TimeoutException>();
 
-        // Give the async stderr reader a moment to flush the line
-        // through OutputDataReceived after the process exits.
-        await Task.Delay(200);
+        // Poll rather than a fixed delay - the async stdio pump tasks
+        // (PumpStreamAsync) run independently of StartAsync's own
+        // timeout, so there's no guaranteed instant at which "the
+        // R process errored" implies "DiagnosticOutput has already
+        // fired" without waiting a little.
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+        while (stderrLines.Count == 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
 
-        Assert.NotEmpty(stderrLines);
+        stderrLines.Should().NotBeEmpty();
     }
 }
