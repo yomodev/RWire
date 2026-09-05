@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
@@ -50,6 +51,7 @@ public enum SupervisorState
     NotStarted,
     Starting,
     Ready,
+    Busy,
     Faulted,
     Disposed,
 }
@@ -69,6 +71,8 @@ public enum SupervisorState
 /// </summary>
 public sealed class ProcessSupervisor : IDisposable
 {
+    private static long _nextSessionId;
+
     private readonly RWireOptions _options;
     private readonly Process _process;
     private readonly TcpListener _listener;
@@ -81,6 +85,18 @@ public sealed class ProcessSupervisor : IDisposable
     private bool _disposed;
 
     public SupervisorState State { get; private set; } = SupervisorState.NotStarted;
+
+    /// <summary>
+    /// Identifies this process's session. RHandles are stamped with
+    /// the SessionId of the supervisor that created them - using one
+    /// after a (future Phase 6) restart, when this would change,
+    /// throws rather than silently addressing a new process's
+    /// registry with a stale id. Fixed for the lifetime of this
+    /// instance today, since Phase 6's restart logic doesn't exist
+    /// yet - the field exists now so handles are already
+    /// restart-safe by construction once it does.
+    /// </summary>
+    public ulong SessionId { get; } = (ulong)Interlocked.Increment(ref _nextSessionId);
 
     /// <summary>The ephemeral loopback port the R process was told to connect back to.</summary>
     public int Port { get; }
@@ -138,7 +154,7 @@ public sealed class ProcessSupervisor : IDisposable
         };
         _process.Exited += (_, _) =>
         {
-            if (State is SupervisorState.Starting or SupervisorState.Ready)
+            if (State is SupervisorState.Starting or SupervisorState.Ready or SupervisorState.Busy)
             {
                 State = SupervisorState.Faulted;
             }
@@ -235,8 +251,8 @@ public sealed class ProcessSupervisor : IDisposable
 
         ReadOnlySpan<byte> payload = frame.Payload.Span;
         int offset = 0;
-        string receivedToken = ReadLengthPrefixedString(payload, ref offset);
-        string rVersion = ReadLengthPrefixedString(payload, ref offset);
+        string receivedToken = WireStrings.Read(payload, ref offset);
+        string rVersion = WireStrings.Read(payload, ref offset);
 
         if (receivedToken != _token)
         {
@@ -246,26 +262,6 @@ public sealed class ProcessSupervisor : IDisposable
         }
 
         RVersion = rVersion;
-    }
-
-    private static string ReadLengthPrefixedString(ReadOnlySpan<byte> buffer, ref int offset)
-    {
-        if (offset + 4 > buffer.Length)
-        {
-            throw new InvalidDataException("HELLO payload truncated while reading a string length.");
-        }
-
-        int length = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(offset, 4));
-        offset += 4;
-
-        if (length < 0 || offset + length > buffer.Length)
-        {
-            throw new InvalidDataException("HELLO payload truncated while reading string bytes.");
-        }
-
-        string value = Encoding.UTF8.GetString(buffer.Slice(offset, length));
-        offset += length;
-        return value;
     }
 
     /// <summary>
@@ -328,6 +324,571 @@ public sealed class ProcessSupervisor : IDisposable
                 _connectionLock.Release();
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // EVAL / CALL (docs/spec.md sections 4.4 and 5) - both sync and
+    // async variants, sharing the same encode/decode logic, neither
+    // derived from the other (same principle as RConnection).
+    // -----------------------------------------------------------------
+
+    private void EnsureReady()
+    {
+        if (State != SupervisorState.Ready)
+        {
+            throw new InvalidOperationException(
+                $"Cannot make a call while in state {State} (must be Ready).");
+        }
+    }
+
+    /// <summary>
+    /// Evaluates an arbitrary R expression and returns its value.
+    /// Throws RErrorException for a caught R-side error (connection
+    /// stays healthy) or other exceptions for a protocol/connection
+    /// failure (connection is marked Faulted).
+    /// </summary>
+    public RValue Eval(string expression)
+    {
+        EnsureReady();
+        _connectionLock.Wait();
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            _connection.Send(MsgType.Eval, correlationId, EncodeEvalPayload(expression));
+            using Frame response = _connection.Receive();
+            RValue result = DecodeResponse(response);
+            State = SupervisorState.Ready;
+            return result;
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Async counterpart of <see cref="Eval"/>.</summary>
+    public async Task<RValue> EvalAsync(string expression, CancellationToken ct = default)
+    {
+        EnsureReady();
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            await _connection.SendAsync(MsgType.Eval, correlationId, EncodeEvalPayload(expression), ct)
+                .ConfigureAwait(false);
+            using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
+            RValue result = DecodeResponse(response);
+            State = SupervisorState.Ready;
+            return result;
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Invokes a named R function with the given arguments (all
+    /// inline values in Phase 2 - handle-typed arguments arrive in
+    /// Phase 3) and returns its value.
+    /// </summary>
+    /// <summary>
+    /// Invokes a named R function with the given arguments - each
+    /// argument is either an inline RValue or an RHandle (implicitly
+    /// convertible to RCallArgument), resolved on the R side without
+    /// a handle's underlying data crossing the wire.
+    /// </summary>
+    public RValue Call(string functionName, IReadOnlyList<RCallArgument> arguments)
+    {
+        EnsureReady();
+        ValidateHandleArguments(arguments);
+        _connectionLock.Wait();
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            _connection.Send(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments));
+            using Frame response = _connection.Receive();
+            RValue result = DecodeResponse(response);
+            State = SupervisorState.Ready;
+            return result;
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Async counterpart of <see cref="Call"/>.</summary>
+    public async Task<RValue> CallAsync(
+        string functionName, IReadOnlyList<RCallArgument> arguments, CancellationToken ct = default)
+    {
+        EnsureReady();
+        ValidateHandleArguments(arguments);
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            await _connection
+                .SendAsync(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments), ct)
+                .ConfigureAwait(false);
+            using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
+            RValue result = DecodeResponse(response);
+            State = SupervisorState.Ready;
+            return result;
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    private void ValidateHandleArguments(IReadOnlyList<RCallArgument> arguments)
+    {
+        foreach (RCallArgument arg in arguments)
+        {
+            if (arg.IsHandle)
+            {
+                ValidateHandle(arg.Handle);
+                _ = arg.Handle.Id; // throws ObjectDisposedException up front if already released,
+                                   // before entering the connection lock / Busy state below - a
+                                   // disposed-handle mistake is a client bug, not a connection
+                                   // failure, and must not fault the supervisor.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Throws if handle belongs to a different (e.g. pre-restart)
+    /// session than this supervisor - see RHandle's and SessionId's
+    /// doc comments.
+    /// </summary>
+    private void ValidateHandle(RHandle handle)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+        if (handle.SessionId != SessionId)
+        {
+            throw new ObjectDisposedException(
+                nameof(RHandle),
+                "This handle belongs to a previous R process session and is no longer valid.");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Object registry: SET_OBJ / GET_OBJ / CREATE_REF / RELEASE_REF
+    // (docs/spec.md section 8). Refcounting lives entirely on the R
+    // side - RHandle here is a thin, disposable proxy.
+    // -----------------------------------------------------------------
+
+    /// <summary>Stores a value in the R worker's object registry and returns a handle to it (refcount starts at 1).</summary>
+    public async Task<RHandle> SetObjAsync(RValue value, CancellationToken ct = default)
+    {
+        EnsureReady();
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            var writer = new ArrayBufferWriter<byte>();
+            RValueCodec.Encode(writer, value);
+            await _connection.SendAsync(MsgType.SetObj, correlationId, writer.WrittenMemory, ct)
+                .ConfigureAwait(false);
+            using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
+            long id = DecodeHandleIdResult(response);
+            State = SupervisorState.Ready;
+            return new RHandle(this, SessionId, id);
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Sync counterpart of <see cref="SetObjAsync"/>.</summary>
+    public RHandle SetObj(RValue value)
+    {
+        EnsureReady();
+        _connectionLock.Wait();
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            var writer = new ArrayBufferWriter<byte>();
+            RValueCodec.Encode(writer, value);
+            _connection.Send(MsgType.SetObj, correlationId, writer.WrittenSpan);
+            using Frame response = _connection.Receive();
+            long id = DecodeHandleIdResult(response);
+            State = SupervisorState.Ready;
+            return new RHandle(this, SessionId, id);
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Fetches the value referenced by handle.</summary>
+    public async Task<RValue> GetObjAsync(RHandle handle, CancellationToken ct = default)
+    {
+        ValidateHandle(handle);
+        long id = handle.Id; // throws ObjectDisposedException up front, before Busy/lock, if already released
+        EnsureReady();
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            await _connection.SendAsync(MsgType.GetObj, correlationId, EncodeHandleId(id), ct)
+                .ConfigureAwait(false);
+            using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
+            RValue result = DecodeResponse(response);
+            State = SupervisorState.Ready;
+            return result;
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Sync counterpart of <see cref="GetObjAsync"/>.</summary>
+    public RValue GetObj(RHandle handle)
+    {
+        ValidateHandle(handle);
+        long id = handle.Id; // throws ObjectDisposedException up front, before Busy/lock, if already released
+        EnsureReady();
+        _connectionLock.Wait();
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            _connection.Send(MsgType.GetObj, correlationId, EncodeHandleId(id));
+            using Frame response = _connection.Receive();
+            RValue result = DecodeResponse(response);
+            State = SupervisorState.Ready;
+            return result;
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Increments the R-side refcount for handle's object and returns a new, independently-disposable handle to it.</summary>
+    public async Task<RHandle> CreateRefAsync(RHandle handle, CancellationToken ct = default)
+    {
+        ValidateHandle(handle);
+        long id = handle.Id; // throws ObjectDisposedException up front, before Busy/lock, if already released
+        EnsureReady();
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            await _connection.SendAsync(MsgType.CreateRef, correlationId, EncodeHandleId(id), ct)
+                .ConfigureAwait(false);
+            using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
+            EnsureSuccessAck(response);
+            State = SupervisorState.Ready;
+            return new RHandle(this, SessionId, id);
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>Sync counterpart of <see cref="CreateRefAsync"/>.</summary>
+    public RHandle CreateRef(RHandle handle)
+    {
+        ValidateHandle(handle);
+        long id = handle.Id; // throws ObjectDisposedException up front, before Busy/lock, if already released
+        EnsureReady();
+        _connectionLock.Wait();
+        State = SupervisorState.Busy;
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            _connection.Send(MsgType.CreateRef, correlationId, EncodeHandleId(id));
+            using Frame response = _connection.Receive();
+            EnsureSuccessAck(response);
+            State = SupervisorState.Ready;
+            return new RHandle(this, SessionId, id);
+        }
+        catch (RErrorException)
+        {
+            State = SupervisorState.Ready;
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Sends RELEASE_REF for id. Internal - the intended caller is
+    /// RHandle.Dispose()/finalizer via ReleaseHandleBestEffort; exposed
+    /// at this level (rather than only the fire-and-forget wrapper) so
+    /// tests can await completion and assert on failures directly,
+    /// which the best-effort path deliberately swallows.
+    /// </summary>
+    internal async Task ReleaseRefAsync(long id, CancellationToken ct = default)
+    {
+        await _connectionLock.WaitAsync(ct).ConfigureAwait(false);
+        bool wasReady = State == SupervisorState.Ready;
+        if (wasReady)
+        {
+            State = SupervisorState.Busy;
+        }
+
+        try
+        {
+            uint correlationId = _connection!.NextCorrelationId();
+            await _connection.SendAsync(MsgType.ReleaseRef, correlationId, EncodeHandleId(id), ct)
+                .ConfigureAwait(false);
+            using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
+            EnsureSuccessAck(response);
+            if (wasReady)
+            {
+                State = SupervisorState.Ready;
+            }
+        }
+        catch (RErrorException)
+        {
+            if (wasReady)
+            {
+                State = SupervisorState.Ready;
+            }
+            throw;
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Called from RHandle.Dispose()/finalizer. Fire-and-forget and
+    /// exception-swallowing by design: Dispose must never throw, a
+    /// finalizer thread cannot safely be blocked on, and a handle
+    /// whose session has already ended has nothing left to release.
+    /// </summary>
+    internal void ReleaseHandleBestEffort(ulong sessionId, long id)
+    {
+        if (sessionId != SessionId || State != SupervisorState.Ready)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ReleaseRefAsync(id, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort - see summary above.
+            }
+        });
+    }
+
+    private static byte[] EncodeHandleId(long id)
+    {
+        byte[] buffer = new byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(buffer, id);
+        return buffer;
+    }
+
+    private static long DecodeHandleIdResult(Frame response)
+    {
+        if (response.MsgType == MsgType.Error)
+        {
+            int offset = 0;
+            throw new RErrorException(WireStrings.Read(response.Payload.Span, ref offset));
+        }
+
+        if (response.MsgType != MsgType.Result || response.Payload.Length != 8)
+        {
+            throw new InvalidOperationException(
+                $"Expected an 8-byte handle id in RESULT, got {response.MsgType} " +
+                $"with {response.Payload.Length} payload bytes.");
+        }
+
+        return BinaryPrimitives.ReadInt64LittleEndian(response.Payload.Span);
+    }
+
+    private static void EnsureSuccessAck(Frame response)
+    {
+        if (response.MsgType == MsgType.Error)
+        {
+            int offset = 0;
+            throw new RErrorException(WireStrings.Read(response.Payload.Span, ref offset));
+        }
+
+        if (response.MsgType != MsgType.Result)
+        {
+            throw new InvalidOperationException($"Expected RESULT or ERROR, got {response.MsgType}.");
+        }
+    }
+
+    private static byte[] EncodeEvalPayload(string expression)
+    {
+        var writer = new ArrayBufferWriter<byte>();
+        WireStrings.Write(writer, expression);
+        return writer.WrittenSpan.ToArray();
+    }
+
+    private static byte[] EncodeCallPayload(string functionName, IReadOnlyList<RCallArgument> arguments)
+    {
+        var writer = new ArrayBufferWriter<byte>();
+        WireStrings.Write(writer, functionName);
+
+        Span<byte> countSpan = writer.GetSpan(4);
+        BinaryPrimitives.WriteInt32LittleEndian(countSpan, arguments.Count);
+        writer.Advance(4);
+
+        foreach (RCallArgument arg in arguments)
+        {
+            Span<byte> isHandleSpan = writer.GetSpan(1);
+            isHandleSpan[0] = (byte)(arg.IsHandle ? 1 : 0);
+            writer.Advance(1);
+
+            if (arg.IsHandle)
+            {
+                long id = arg.Handle.Id; // throws ObjectDisposedException if released
+                Span<byte> idSpan = writer.GetSpan(8);
+                BinaryPrimitives.WriteInt64LittleEndian(idSpan, id);
+                writer.Advance(8);
+            }
+            else
+            {
+                RValueCodec.Encode(writer, arg.Value);
+            }
+        }
+
+        return writer.WrittenSpan.ToArray();
+    }
+
+    private static RValue DecodeResponse(Frame response)
+    {
+        if (response.MsgType == MsgType.Error)
+        {
+            int offset = 0;
+            throw new RErrorException(WireStrings.Read(response.Payload.Span, ref offset));
+        }
+
+        if (response.MsgType != MsgType.Result)
+        {
+            throw new InvalidOperationException(
+                $"Expected RESULT or ERROR, got {response.MsgType}.");
+        }
+
+        return RValueCodec.Decode(response.Payload.Span);
     }
 
     /// <summary>

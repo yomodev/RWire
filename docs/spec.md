@@ -282,9 +282,15 @@ recursive using the same value-encoder already defined.
   ```
   [AttrCount(4)] { [NameLen+Name][Value, recursively encoded] }*
   ```
-- **Factors** get an explicit fast path (integer codes + `class` +
-  `levels` character vector) rather than falling through the generic
-  attribute block, since they're extremely common in real R code.
+- **Factors** get `class = ["factor"]` via the fast-path Class slot;
+  `levels` rides the generic attribute block as a single recursive
+  entry rather than getting its own dedicated header slot. This is a
+  narrower "fast path" than originally described here — implementation
+  found that fast-pathing `class` alone (avoiding the slow, fully
+  generic attribute-list path for the one attribute that's genuinely
+  hot) already captures the practical benefit, and a fully bespoke
+  factor wire shape wasn't worth the added complexity. See
+  `docs/progress.md`'s "Decisions changed since spec.md".
 - C# side surface: an `RValue` wrapper exposing `Names`/`Dim`/`Class`
   as first-class optional properties plus a generic `Attributes`
   dictionary catch-all, so consumers can pattern-match on `Class`

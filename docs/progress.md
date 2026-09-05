@@ -23,66 +23,77 @@ diverging.
 
 ## Current phase
 
-**Phase 1 — Channel abstraction & frame protocol** (implementation
-written, not yet built/run — see "Notes / blockers" below)
+**Phase 3 — Reference counting** (implementation written, not yet
+built/run — see "Notes / blockers" below)
 
-Phase 0 (skeleton & handshake) is superseded by Phase 1's real
-protocol — the placeholder handshake described in the original Phase 0
-notes no longer exists in the code; `ProcessSupervisor`/`worker.R` now
-do the real `HELLO` exchange described below.
+Phase 2 status: still "code written, unbuilt" as of this update — it
+was not built/tested before Phase 3 work started. Build and test
+Phase 2 and Phase 3 together; there's no meaningful checkpoint between
+them anymore since Phase 3 builds directly on Phase 2's RValueCodec.
+
+Phase 3 adds, on top of Phase 2:
 
 Implemented:
-- `src/RWire/IRChannel.cs` — transport interface, dual sync/async,
-  neither derived from the other.
-- `src/RWire/SocketRChannel.cs` — the v1 (and so far only) `IRChannel`
-  implementation, over `NetworkStream`.
-- `src/RWire/MsgType.cs` — wire message type enum (see "Decisions
-  changed since spec.md" below — values differ slightly from the
-  original spec table, which is now corrected to match).
-- `src/RWire/FrameCodec.cs` — pure `Span<byte>`-based encode/decode,
-  no transport dependency; cross-checks `PayloadLen` against the
-  outer `Length` field on decode and throws `InvalidDataException` on
-  any inconsistency or unknown `MsgType` byte.
-- `src/RWire/Frame.cs` — decoded frame wrapper, payload buffer rented
-  from `ArrayPool<byte>.Shared`, returned on `Dispose()`.
-- `src/RWire/RConnection.cs` — `Send`/`Receive` (sync) and
-  `SendAsync`/`ReceiveAsync` (async) built from `IRChannel` +
-  `FrameCodec`; both paths implemented independently, sharing no
-  execution code, only the same wire format.
-- `src/RWire/ProcessSupervisor.cs` — rewritten: real `HELLO` handshake
-  (token + `R.version.string`, both length-prefixed UTF-8 strings) via
-  `RConnection`; `PeriodicTimer`-driven heartbeat (`PING`/`PONG`) that
-  skips a tick rather than blocking if an application call already
-  holds the connection lock; `Dispose()` now sends a real `SHUTDOWN`
-  frame before the existing close-socket/grace-period/force-kill
-  sequence.
-- `r/worker.R` — rewritten: real frame read/write functions, sends
-  `HELLO` on connect, message loop dispatches `PING`→`PONG` and
-  `SHUTDOWN`→`RESULT`+exit; every other `MsgType` gets a well-formed
-  `ERROR` response (not implemented until Phases 2–3) rather than
-  hanging, crashing, or being silently dropped; per-request R errors
-  are caught and turned into `ERROR` frames without ending the loop.
-- Tests: `FrameCodecTests.cs` (pure unit, round-trip + corruption
-  cases), `RConnectionTests.cs` (loopback-socket unit tests, no R
-  process — round-trip, zero-length payload, closed-channel EOF,
-  correlation ID increment), `ProcessSupervisorTests.cs` (rewritten:
-  handshake now asserts `RVersion` populated; added heartbeat-stays-
-  Ready, external-kill-detected-as-Faulted, and graceful-shutdown-
-  clean-exit-code tests).
-- `src/RWire/AssemblyInfo.cs` — `InternalsVisibleTo("RWire.Tests")` so
-  tests can reach `ProcessSupervisor.ProcessForTesting` (needed to
-  simulate an external kill) without making it public API.
+- `src/RWire/RHandle.cs` — thin `IDisposable` proxy (not `SafeHandle` —
+  see "Decisions changed since spec.md") stamped with the owning
+  `ProcessSupervisor`'s `SessionId`; `Dispose()` calls
+  `ReleaseHandleBestEffort` (fire-and-forget, exception-swallowing —
+  Dispose must never throw); a finalizer exists as the last-resort net
+  spec.md describes, not the primary path.
+- `src/RWire/RCallArgument.cs` — discriminated union (inline `RValue`
+  or `RHandle`) with implicit conversions from both, so
+  `Call`/`CallAsync` call sites rarely need to construct it explicitly.
+  This **changed the public signature** of `Call`/`CallAsync` from
+  `IReadOnlyList<RValue>` to `IReadOnlyList<RCallArgument>` — a source
+  break from Phase 2, fixed up in `EvalCallIntegrationTests.cs`.
+- `src/RWire/ProcessSupervisor.cs` — added:
+  - `SessionId` (a process-wide monotonic counter via
+    `Interlocked.Increment`, stamped on every `RHandle` created by
+    this instance) and `ValidateHandle` (throws `ObjectDisposedException`
+    if a handle's `SessionId` doesn't match — stands in for "this
+    handle survived a restart it shouldn't have," ready for Phase 6
+    even though restart doesn't exist yet).
+  - `SetObj`/`SetObjAsync`, `GetObj`/`GetObjAsync`,
+    `CreateRef`/`CreateRefAsync` (sync+async, same pattern as
+    `Eval`/`Call`: `RErrorException` restores `Ready`, everything else
+    faults). `Call`/`CallAsync` updated to validate and resolve any
+    handle arguments *before* acquiring the connection lock / entering
+    `Busy` — an already-disposed handle is a client bug and must throw
+    `ObjectDisposedException` without touching supervisor state, not
+    get treated as a connection failure.
+  - `ReleaseRefAsync` (internal) and `ReleaseHandleBestEffort` — the
+    actual RELEASE_REF call and the fire-and-forget wrapper
+    RHandle.Dispose/finalizer use.
+  - Wire helpers `EncodeHandleId`/`DecodeHandleIdResult` (8-byte LE
+    handle IDs) and `EnsureSuccessAck` (RESULT-with-empty-payload =
+    success, shared by CREATE_REF/RELEASE_REF).
+- `r/worker.R` — the object registry (`.rwire_registry`, an
+  `environment()`-as-hashtable), handle ID allocation (see "Decisions
+  changed since spec.md" — 32-bit, not the full 64-bit wire slot),
+  `SET_OBJ`/`GET_OBJ`/`CREATE_REF`/`RELEASE_REF` handlers, the
+  leak-guard sweep (piggybacked on the existing `PING` handler rather
+  than a separate timer), and `CALL`'s handle-argument branch now
+  actually resolves via the registry instead of throwing "not
+  implemented."
+- Tests: `HandleLifecycleTests.cs` covering the full spec §12.4 list
+  (set→get round-trip, dispose→registry-empty, use-after-dispose
+  throws, two-handles-via-CreateRef, double-release-is-a-no-op) plus a
+  session-mismatch test standing in for the "old handle after a crash/
+  restart" scenario (using a second, independent `ProcessSupervisor`
+  instance, since Phase 6's actual restart doesn't exist yet — this
+  tests the piece Phase 3 owns: the `SessionId` check itself, not the
+  restart machinery around it). `EvalCallIntegrationTests.cs` updated
+  for the `RCallArgument` signature change and given a new
+  handle-as-CALL-argument test.
 
 Not yet implemented (by design — later phases):
-- `EXEC`/`EVAL`/`CALL`/`GET_OBJ`/`SET_OBJ`/`CREATE_REF`/`RELEASE_REF`
-  — all defined in `MsgType` but stubbed to return `ERROR` from
-  `worker.R`'s dispatcher (Phases 2–3).
-- Full `SupervisorState` state machine (`Restarting`, backoff) — only
-  `NotStarted`/`Starting`/`Ready`/`Faulted`/`Disposed` exist.
-- `System.IO.Pipelines` — `RConnection`'s async path currently reads
-  directly off `IRChannel.ReadAsync` rather than through
-  `PipeReader`; spec §9 leaves this as a later optimization to
-  benchmark (Phase 7), not a Phase 1 requirement.
+- `TABLE` type (Phase 4).
+- Full crash/restart integration with the handle registry — Phase 6
+  needs to actually invalidate *all* outstanding handles from a
+  session when that session's process is replaced; today `SessionId`
+  only prevents a handle from a genuinely different `ProcessSupervisor`
+  instance from being misused, which is the right primitive but isn't
+  wired into any restart logic yet because there isn't any.
 
 ## Locked-in decisions (see spec.md for full detail/rationale)
 
@@ -108,19 +119,19 @@ Not yet implemented (by design — later phases):
 
 ## Phase checklist
 
-- [x] Phase 0 — Skeleton & handshake (superseded by Phase 1's real handshake — see above)
-- [ ] Phase 1 — Channel abstraction & frame protocol (code written, unbuilt — see current-phase notes)
-- [ ] Phase 2 — Atomic type mapping (hot path)
-- [ ] Phase 3 — Reference counting
+- [x] Phase 0 — Skeleton & handshake (superseded by Phase 1's real handshake)
+- [~] Phase 1 — Channel abstraction & frame protocol (builds; tests not yet confirmed passing)
+- [ ] Phase 2 — Atomic type mapping (hot path) (code written, unbuilt)
+- [ ] Phase 3 — Reference counting (code written, unbuilt)
 - [ ] Phase 4 — `TABLE` type & bulk transfer
 - [ ] Phase 5 — Cold path (serialize/unserialize) + irregular lists
 - [ ] Phase 6 — Process supervision & resilience
 - [ ] Phase 7 — Performance hardening
 
 Each phase's detail doc has its own finer-grained checklist — this
-top-level one is just for at-a-glance status. None of these get a
-final checkmark until `dotnet test` has actually passed against real
-R/.NET installations — see "Notes / blockers."
+top-level one is just for at-a-glance status. `[~]` means "builds but
+not test-verified"; nothing gets a plain `[x]` until `dotnet test`
+has actually passed for that phase's suite.
 
 ## Decisions changed since spec.md was written
 
@@ -133,29 +144,99 @@ R/.NET installations — see "Notes / blockers."
   `docs/spec.md` §4.2 has been corrected to match; `src/RWire/MsgType.cs`
   is the source of truth for numbering going forward.
 
+- **Logical vectors: only the compact (1-byte) wire encoding was
+  implemented, not the wide (4-byte)/compact negotiated pair spec
+  §5.2 describes.** The per-message size-based negotiation is a
+  performance optimization with no observable difference until
+  benchmarking (Phase 7) actually shows the 1-byte-per-element remap
+  cost matters at scale. Implementing both forms now (with a flag
+  byte to signal which) would have added real complexity for a
+  question Phase 2 has no data to answer yet. `RValueCodec` uses
+  compact-only; revisit in Phase 7 if benchmarks justify it, and
+  update this entry (or remove it) at that point.
+
+- **Factor encoding is narrower than spec §5.3 originally described.**
+  Only `class` is fast-pathed (via the existing Class header slot);
+  `levels` rides the generic attribute block as a single recursive
+  `RValue` entry rather than getting its own dedicated wire slot.
+  `docs/spec.md` §5.3 has been corrected to describe this as the
+  actual design rather than a fully bespoke factor shape — the
+  practical win (avoiding the slow path for the attribute that's
+  actually common) is already captured without the added complexity
+  of a fully separate factor wire format.
+
+- **RHandle is a plain `IDisposable` class with a finalizer, not
+  `SafeHandle`.** Phase 3's planning doc left this open explicitly.
+  `SafeHandle` is designed around wrapping a native/unmanaged handle
+  value with OS-level semantics (`IsInvalid`, `ReleaseHandle` running
+  on a special reliability path); RWire's handle is a logical 64-bit
+  ID with no OS resource behind it. The plain-class approach with an
+  explicit `Dispose()` as the primary path and a finalizer as a
+  documented last resort gets the same safety properties spec.md
+  section 8 asks for without inheriting `SafeHandle`'s native-interop-
+  shaped API.
+
+- **Double-release is a no-op, not an error.** Also left open by the
+  Phase 3 plan. `rwire_registry_release` on an already-gone key simply
+  returns rather than raising a condition — a client-side double-
+  release (Dispose racing a finalizer, or a caller disposing twice by
+  mistake) is a normal, harmless occurrence and turning it into a
+  protocol-level error would make defensive `Dispose()` patterns
+  actively dangerous. `HandleLifecycleTests.DoubleRelease_IsANoOp_NotAnError`
+  tests this directly.
+
+- **Handle IDs are allocated as 32-bit R integers, not the full 64-bit
+  range the wire format's 8-byte slot implies.** Base R has no native
+  64-bit integer type without the `bit64` package, and generating IDs
+  as R integers means R's own overflow behavior naturally caps the
+  practical range at ~2 billion objects per session — far more than
+  any realistic session needs. The wire slot is still 8 bytes (high
+  4 bytes always zero, and required to be zero on read) so nothing
+  about the frame format needs to change if a future need for the
+  full range ever appears; only the R-side allocator would need to
+  change. See `r/worker.R`'s `write_handle_id`/`read_handle_id`.
+
+- **A disposed-handle mistake is validated and thrown *before*
+  acquiring the connection lock / entering `Busy` state**, in
+  `GetObj(Async)`, `CreateRef(Async)`, and `Call(Async)`'s handle
+  arguments. This wasn't called out explicitly in the Phase 3 plan but
+  is a direct consequence of spec.md's own non-fatal-error principle
+  (section 12.5): using an already-disposed `RHandle` is a client
+  programming error, not a connection or protocol failure, and must
+  not fault the supervisor the way a genuine wire-level problem would.
+
 ## Notes / blockers
 
-- All code so far (Phases 0 and 1) was written in an environment with
-  **no .NET SDK and no R installation available**, so `dotnet build` /
-  `dotnet test` have **not** been run against any of it yet. Treat it
-  as a solid draft matching the relevant checklists, not as
-  verified-working code. First thing to do on a machine with both
-  toolchains installed:
-  1. `dotnet build` — fix whatever compiler errors turn up (most
-     likely candidates: a `using`/namespace nit, or a .NET 10 API
-     shape difference between preview/RC builds).
-  2. `dotnet test` — start with `FrameCodecTests` and
-     `RConnectionTests` (pure C#/loopback-socket, no R dependency) to
-     isolate protocol-layer bugs before debugging anything that
-     involves the R process.
-  3. Then `ProcessSupervisorTests` (needs `Rscript` on PATH) — the
-     heartbeat and external-kill tests have real timing assumptions
-     (`HeartbeatInterval`/`HeartbeatResponseTimeout` in the hundreds
-     of ms to a few seconds) that may need loosening on a slower CI
-     machine if they're flaky.
-- `worker.R`'s frame constants (`MSG_HELLO`, `MSG_PING`, etc.) are
-  hand-kept in sync with `src/RWire/MsgType.cs` — there's no shared
-  source of truth between the two languages yet. If a future phase
-  adds a code-generation step for this, note it here; until then,
-  changing one without the other is a real way to silently break the
-  protocol.
+- Phase 1's code **builds successfully** (confirmed on a real machine).
+  Its tests have not been confirmed passing yet.
+- Phases 2 and 3's code has **not been built at all**. Build order:
+  1. `dotnet build` — Phase 3 touched `Call`/`CallAsync`'s public
+     signature (now `IReadOnlyList<RCallArgument>`), so a Phase 2-only
+     partial build isn't meaningful; build everything together.
+  2. `RValueCodecTests` (pure C#) — as before, run
+     `Double_NaReal_And_ComputedNaN_StayDistinct_AfterRoundTrip` first.
+  3. `EvalCallIntegrationTests` and `HandleLifecycleTests` (need
+     `Rscript`) — `HandleLifecycleTests` depends on `EvalAsync` working
+     correctly (it uses `EvalAsync("exists(...)")` as a diagnostic
+     probe into the R-side registry), so if `EvalCallIntegrationTests`
+     is failing, fix that before debugging `HandleLifecycleTests`.
+- `worker.R`'s registry functions (`rwire_registry_*`) have not been
+  checked against a real R interpreter. The riskiest assumption:
+  `assign()`/`get()` on a `list(value=..., refcount=..., last_touched=...)`
+  stored by string key in an `environment()` — this is a standard R
+  pattern but hasn't been exercised here. If `HandleLifecycleTests`
+  fails oddly, check this before suspecting the wire protocol.
+- The `HandleLifecycleTests` tests that poll for the background
+  `ReleaseHandleBestEffort` `Task.Run` to complete
+  (`Dispose_ReleasesTheHandle_FromTheRSideRegistry`,
+  `TwoHandlesViaCreateRef_BothMustBeDisposed_BeforeObjectIsFreed`) have
+  a real timing dependency (polling with a 2-second deadline) — if
+  these are flaky on a slow machine, that's a test tuning issue, not
+  necessarily a correctness bug; check the non-timing assertions in
+  the same test first.
+- `worker.R`'s frame *and* RValue *and* now registry/handle-ID wire
+  shape are still hand-kept in sync with the C# side across three
+  files (`MsgType.cs`/`RTypeTag.cs`/`RValueCodec.cs`) and this doc's
+  own description of the handle ID encoding. This is the same
+  no-shared-source-of-truth risk flagged after Phase 2, now with more
+  surface area.
