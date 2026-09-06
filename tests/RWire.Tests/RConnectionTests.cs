@@ -19,7 +19,7 @@ public class RConnectionTests : IAsyncLifetime
     private TcpClient _clientSide = null!;
     private TcpClient _serverSide = null!;
 
-    public async Task InitializeAsync()
+    public async ValueTask InitializeAsync()
     {
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
@@ -31,12 +31,12 @@ public class RConnectionTests : IAsyncLifetime
         _serverSide = await acceptTask;
     }
 
-    public Task DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         _clientSide.Dispose();
         _serverSide.Dispose();
         _listener.Stop();
-        return Task.CompletedTask;
+        return ValueTask.CompletedTask;
     }
 
     private (RConnection Client, RConnection Server) MakeConnectionPair()

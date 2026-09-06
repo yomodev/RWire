@@ -19,16 +19,16 @@ public sealed class RWireProcessFixture : IAsyncLifetime
     public static string WorkerScriptPath =>
         Path.Combine(AppContext.BaseDirectory, "r", "worker.R");
 
-    public async Task InitializeAsync()
+    public async ValueTask InitializeAsync()
     {
         Supervisor = new ProcessSupervisor(new RWireOptions { WorkerScriptPath = WorkerScriptPath });
         await Supervisor.StartAsync();
     }
 
-    public Task DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         Supervisor.Dispose();
-        return Task.CompletedTask;
+        return ValueTask.CompletedTask;
     }
 }
 

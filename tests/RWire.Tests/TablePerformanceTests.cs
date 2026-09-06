@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using AwesomeAssertions;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace RWire.Tests;
 

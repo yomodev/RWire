@@ -9,8 +9,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- xunit.v3 replaces the (now deprecated) xunit v2 "xunit" meta
+         package. xunit.v3 changed a few APIs used in this project:
+         IAsyncLifetime.InitializeAsync()/DisposeAsync() now return
+         ValueTask (were Task), and ITestOutputHelper moved from the
+         separate Xunit.Abstractions assembly into xunit.v3 itself
+         (namespace Xunit, not Xunit.Abstractions) - both already
+         updated in the test files below. -->
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
-    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.v3" Version="1.0.1" />
     <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
@@ -23,12 +30,15 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Makes r/worker.R available next to the test binaries so tests
-         can locate it without depending on the source-tree layout at
-         run time. -->
-    <None Include="..\..\r\worker.R">
+    <!-- Makes the whole r/ directory (worker.R plus tests/testthat/*)
+         available next to the test binaries, preserving its relative
+         layout, so tests can locate it without depending on the
+         source-tree layout at run time. RTestthatSuiteTests.cs in
+         particular needs the full tests/testthat/ subtree, not just
+         worker.R. -->
+    <None Include="..\..\r\**\*.R">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>r\worker.R</Link>
+      <Link>r\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </None>
   </ItemGroup>
 
