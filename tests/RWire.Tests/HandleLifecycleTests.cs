@@ -27,16 +27,18 @@ public class HandleLifecycleTests
     private async Task<bool> RegistryContainsAsync(long id)
     {
         RValue result = await _supervisor.EvalAsync(
-            $"exists('{id}', envir = .rwire_registry, inherits = FALSE)");
+            $"exists('{id}', envir = .rwire_registry, inherits = FALSE)",
+            TestContext.Current.CancellationToken);
         return result.LogicalCodes![0] == RNumeric.LogicalTrue;
     }
 
     [Fact]
     public async Task SetObj_ThenGetObj_RoundTripsTheValue()
     {
-        using RHandle handle = await _supervisor.SetObjAsync(RValue.OfInteger(new[] { 1, 2, 3 }));
+        using RHandle handle = await _supervisor.SetObjAsync(
+            RValue.OfInteger(new[] { 1, 2, 3 }), TestContext.Current.CancellationToken);
 
-        RValue result = await _supervisor.GetObjAsync(handle);
+        RValue result = await _supervisor.GetObjAsync(handle, TestContext.Current.CancellationToken);
 
         result.IntegerValues.Should().Equal(1, 2, 3);
     }
@@ -44,7 +46,8 @@ public class HandleLifecycleTests
     [Fact]
     public async Task Dispose_ReleasesTheHandle_FromTheRSideRegistry()
     {
-        RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
+        RHandle handle = await _supervisor.SetObjAsync(
+            RValue.OfDouble(new double[] { 1.0 }), TestContext.Current.CancellationToken);
         long id = handle.Id;
 
         handle.Dispose();
@@ -64,10 +67,11 @@ public class HandleLifecycleTests
     [Fact]
     public async Task Handle_UsedAfterDispose_Throws()
     {
-        RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
+        RHandle handle = await _supervisor.SetObjAsync(
+            RValue.OfDouble(new double[] { 1.0 }), TestContext.Current.CancellationToken);
         handle.Dispose();
 
-        Func<Task> act = () => _supervisor.GetObjAsync(handle);
+        Func<Task> act = () => _supervisor.GetObjAsync(handle, TestContext.Current.CancellationToken);
 
         await act.Should().ThrowAsync<ObjectDisposedException>();
     }
@@ -75,9 +79,10 @@ public class HandleLifecycleTests
     [Fact]
     public async Task TwoHandlesViaCreateRef_BothMustBeDisposed_BeforeObjectIsFreed()
     {
-        RHandle first = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 42.0 }));
+        RHandle first = await _supervisor.SetObjAsync(
+            RValue.OfDouble(new double[] { 42.0 }), TestContext.Current.CancellationToken);
         long id = first.Id;
-        RHandle second = await _supervisor.CreateRefAsync(first);
+        RHandle second = await _supervisor.CreateRefAsync(first, TestContext.Current.CancellationToken);
 
         first.Dispose();
         await WaitUntilAsync(() => Task.FromResult(true), timeoutMs: 200); // let the background release attempt run
@@ -85,7 +90,7 @@ public class HandleLifecycleTests
         (await RegistryContainsAsync(id)).Should().BeTrue(
             "the object should still be registered - the second handle's reference is still live");
 
-        RValue result = await _supervisor.GetObjAsync(second);
+        RValue result = await _supervisor.GetObjAsync(second, TestContext.Current.CancellationToken);
         result.DoubleValues![0].Should().Be(42.0);
 
         second.Dispose();
@@ -100,12 +105,13 @@ public class HandleLifecycleTests
         // Directly exercises ReleaseRefAsync twice for the same id -
         // the second call must not throw (docs/progress.md: double
         // release is a no-op by design, not a protocol error).
-        RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
+        RHandle handle = await _supervisor.SetObjAsync(
+            RValue.OfDouble(new double[] { 1.0 }), TestContext.Current.CancellationToken);
         long id = handle.Id;
 
-        await _supervisor.ReleaseRefAsync(id);
+        await _supervisor.ReleaseRefAsync(id, TestContext.Current.CancellationToken);
 
-        Func<Task> secondRelease = () => _supervisor.ReleaseRefAsync(id);
+        Func<Task> secondRelease = () => _supervisor.ReleaseRefAsync(id, TestContext.Current.CancellationToken);
         await secondRelease.Should().NotThrowAsync();
 
         _supervisor.State.Should().Be(SupervisorState.Ready);
@@ -120,13 +126,14 @@ public class HandleLifecycleTests
         // supervisor instance (standing in for "after a restart")
         // rather than silently addressing the wrong process's
         // registry.
-        RHandle handleFromFirstSession = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 1.0 }));
+        RHandle handleFromFirstSession = await _supervisor.SetObjAsync(
+            RValue.OfDouble(new double[] { 1.0 }), TestContext.Current.CancellationToken);
 
         using var secondSupervisor = new ProcessSupervisor(
             new RWireOptions { WorkerScriptPath = RWireProcessFixture.WorkerScriptPath });
-        await secondSupervisor.StartAsync();
+        await secondSupervisor.StartAsync(TestContext.Current.CancellationToken);
 
-        Func<Task> act = () => secondSupervisor.GetObjAsync(handleFromFirstSession);
+        Func<Task> act = () => secondSupervisor.GetObjAsync(handleFromFirstSession, TestContext.Current.CancellationToken);
 
         await act.Should().ThrowAsync<ObjectDisposedException>();
     }
@@ -140,7 +147,7 @@ public class HandleLifecycleTests
             {
                 return;
             }
-            await Task.Delay(50);
+            await Task.Delay(50, TestContext.Current.CancellationToken);
         }
     }
 }

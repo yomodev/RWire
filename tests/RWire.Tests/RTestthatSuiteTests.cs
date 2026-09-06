@@ -43,15 +43,17 @@ public class RTestthatSuiteTests
         using var process = new Process { StartInfo = startInfo };
         process.Start();
 
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromMinutes(2));
+
         // testthat's own console output (pass/fail summary, and any
         // failure details) comes through stdout; R startup/package
         // warnings tend to land on stderr. Both are captured so a
         // failing assertion below can show the reader exactly what
         // testthat reported, rather than just "exit code 1".
-        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
+        Task<string> stderrTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
 
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
         try
         {
             await process.WaitForExitAsync(timeoutCts.Token);

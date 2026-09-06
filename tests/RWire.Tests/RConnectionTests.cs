@@ -25,9 +25,9 @@ public class RConnectionTests : IAsyncLifetime
         _listener.Start();
         int port = ((IPEndPoint)_listener.LocalEndpoint).Port;
 
-        Task<TcpClient> acceptTask = _listener.AcceptTcpClientAsync();
+        var acceptTask = _listener.AcceptTcpClientAsync(TestContext.Current.CancellationToken);
         _clientSide = new TcpClient();
-        await _clientSide.ConnectAsync(IPAddress.Loopback, port);
+        await _clientSide.ConnectAsync(IPAddress.Loopback, port, TestContext.Current.CancellationToken);
         _serverSide = await acceptTask;
     }
 
@@ -67,9 +67,9 @@ public class RConnectionTests : IAsyncLifetime
         (RConnection client, RConnection server) = MakeConnectionPair();
 
         byte[] payload = Encoding.UTF8.GetBytes("async round trip");
-        await client.SendAsync(MsgType.Call, correlationId: 9, payload);
+        await client.SendAsync(MsgType.Call, correlationId: 9, payload, TestContext.Current.CancellationToken);
 
-        using Frame received = await server.ReceiveAsync();
+        using Frame received = await server.ReceiveAsync(TestContext.Current.CancellationToken);
 
         received.MsgType.Should().Be(MsgType.Call);
         received.CorrelationId.Should().Be(9u);

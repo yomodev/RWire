@@ -48,11 +48,11 @@ public class TablePerformanceTests
         RValue table = RandomTableGenerator.GenerateTable(rowCount, random);
 
         var setStopwatch = Stopwatch.StartNew();
-        using RHandle handle = await _supervisor.SetObjAsync(table);
+        using RHandle handle = await _supervisor.SetObjAsync(table, TestContext.Current.CancellationToken);
         setStopwatch.Stop();
 
         var getStopwatch = Stopwatch.StartNew();
-        RValue roundTripped = await _supervisor.GetObjAsync(handle);
+        RValue roundTripped = await _supervisor.GetObjAsync(handle, TestContext.Current.CancellationToken);
         getStopwatch.Stop();
 
         roundTripped.TypeTag.Should().Be(RTypeTag.Table);
@@ -79,8 +79,8 @@ public class TablePerformanceTests
         RValue list = RandomTableGenerator.GenerateMixedList(elementCount, rowsPerElement: 500, random);
 
         var stopwatch = Stopwatch.StartNew();
-        using RHandle handle = await _supervisor.SetObjAsync(list);
-        RValue roundTripped = await _supervisor.GetObjAsync(handle);
+        using RHandle handle = await _supervisor.SetObjAsync(list, TestContext.Current.CancellationToken);
+        RValue roundTripped = await _supervisor.GetObjAsync(handle, TestContext.Current.CancellationToken);
         stopwatch.Stop();
 
         roundTripped.TypeTag.Should().Be(RTypeTag.List);

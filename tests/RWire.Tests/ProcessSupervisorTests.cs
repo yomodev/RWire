@@ -34,7 +34,7 @@ public class ProcessSupervisorTests
         var options = new RWireOptions { WorkerScriptPath = WorkerScriptPath };
 
         using var supervisor = new ProcessSupervisor(options);
-        await supervisor.StartAsync();
+        await supervisor.StartAsync(TestContext.Current.CancellationToken);
 
         supervisor.State.Should().Be(SupervisorState.Ready);
         supervisor.Port.Should().BePositive();
@@ -53,7 +53,7 @@ public class ProcessSupervisorTests
 
         using var supervisor = new ProcessSupervisor(options);
 
-        Func<Task> act = () => supervisor.StartAsync();
+        Func<Task> act = () => supervisor.StartAsync(TestContext.Current.CancellationToken);
 
         await act.Should().ThrowAsync<InvalidOperationException>();
         supervisor.State.Should().Be(SupervisorState.Faulted);
@@ -70,7 +70,7 @@ public class ProcessSupervisorTests
 
         using var supervisor = new ProcessSupervisor(options);
 
-        Func<Task> act = () => supervisor.StartAsync();
+        Func<Task> act = () => supervisor.StartAsync(TestContext.Current.CancellationToken);
 
         await act.Should().ThrowAsync<TimeoutException>();
         supervisor.State.Should().Be(SupervisorState.Faulted);
@@ -80,9 +80,9 @@ public class ProcessSupervisorTests
     public async Task Heartbeat_KeepsConnectionAlive_OverMultipleIntervals()
     {
         using var supervisor = new ProcessSupervisor(FastHeartbeatOptions());
-        await supervisor.StartAsync();
+        await supervisor.StartAsync(TestContext.Current.CancellationToken);
 
-        await Task.Delay(TimeSpan.FromSeconds(1.5));
+        await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
 
         supervisor.State.Should().Be(SupervisorState.Ready);
     }
@@ -91,7 +91,7 @@ public class ProcessSupervisorTests
     public async Task ExternalProcessKill_IsDetectedAsFaulted_WithinHeartbeatWindow()
     {
         using var supervisor = new ProcessSupervisor(FastHeartbeatOptions());
-        await supervisor.StartAsync();
+        await supervisor.StartAsync(TestContext.Current.CancellationToken);
         supervisor.State.Should().Be(SupervisorState.Ready);
 
         supervisor.ProcessForTesting.Kill(entireProcessTree: true);
@@ -99,7 +99,7 @@ public class ProcessSupervisorTests
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
         while (supervisor.State == SupervisorState.Ready && DateTime.UtcNow < deadline)
         {
-            await Task.Delay(50);
+            await Task.Delay(50, TestContext.Current.CancellationToken);
         }
 
         supervisor.State.Should().Be(SupervisorState.Faulted);
@@ -110,7 +110,7 @@ public class ProcessSupervisorTests
     {
         var options = new RWireOptions { WorkerScriptPath = WorkerScriptPath };
         var supervisor = new ProcessSupervisor(options);
-        await supervisor.StartAsync();
+        await supervisor.StartAsync(TestContext.Current.CancellationToken);
 
         supervisor.Dispose();
 
@@ -144,7 +144,7 @@ public class ProcessSupervisorTests
         var allLines = new List<string>();
         supervisor.DiagnosticOutput += (line, _) => allLines.Add(line);
 
-        Func<Task> act = () => supervisor.StartAsync();
+        Func<Task> act = () => supervisor.StartAsync(TestContext.Current.CancellationToken);
         await act.Should().ThrowAsync<TimeoutException>();
 
         // Poll rather than a fixed delay - the async stdio pump tasks
@@ -155,7 +155,7 @@ public class ProcessSupervisorTests
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
         while (allLines.Count == 0 && DateTime.UtcNow < deadline)
         {
-            await Task.Delay(50);
+            await Task.Delay(50, TestContext.Current.CancellationToken);
         }
 
         allLines.Should().NotBeEmpty(

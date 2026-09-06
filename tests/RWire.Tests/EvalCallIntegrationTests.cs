@@ -24,7 +24,7 @@ public class EvalCallIntegrationTests
     [Fact]
     public async Task EvalAsync_SimpleArithmeticExpression_ReturnsCorrectDouble()
     {
-        RValue result = await _supervisor.EvalAsync("21 * 2");
+        RValue result = await _supervisor.EvalAsync("21 * 2", TestContext.Current.CancellationToken);
 
         result.TypeTag.Should().Be(RTypeTag.Double);
         result.DoubleValues![0].Should().Be(42.0);
@@ -42,7 +42,7 @@ public class EvalCallIntegrationTests
     [Fact]
     public async Task EvalAsync_CharacterVector_RoundTrips()
     {
-        RValue result = await _supervisor.EvalAsync("c('a', NA, 'c')");
+        RValue result = await _supervisor.EvalAsync("c('a', NA, 'c')", TestContext.Current.CancellationToken);
 
         result.TypeTag.Should().Be(RTypeTag.Character);
         result.CharacterValues.Should().Equal("a", null, "c");
@@ -52,7 +52,8 @@ public class EvalCallIntegrationTests
     public async Task EvalAsync_FactorExpression_RoundTripsWithLevels()
     {
         RValue result = await _supervisor.EvalAsync(
-            "factor(c('low', 'high', 'low'), levels = c('low', 'medium', 'high'))");
+            "factor(c('low', 'high', 'low'), levels = c('low', 'medium', 'high'))",
+            TestContext.Current.CancellationToken);
 
         result.Class.Should().Contain("factor");
         result.Attributes!["levels"].CharacterValues.Should().Equal("low", "medium", "high");
@@ -62,7 +63,9 @@ public class EvalCallIntegrationTests
     public async Task CallAsync_SumFunction_ReturnsCorrectResult()
     {
         RValue result = await _supervisor.CallAsync(
-            "sum", new RCallArgument[] { RValue.OfDouble(new double[] { 1, 2, 3, 4 }) });
+            "sum",
+            new RCallArgument[] { RValue.OfDouble(new double[] { 1, 2, 3, 4 }) },
+            TestContext.Current.CancellationToken);
 
         result.DoubleValues![0].Should().Be(10.0);
     }
@@ -70,9 +73,11 @@ public class EvalCallIntegrationTests
     [Fact]
     public async Task CallAsync_WithHandleArgument_ResolvesWithoutDataCrossingWireTwice()
     {
-        using RHandle handle = await _supervisor.SetObjAsync(RValue.OfDouble(new double[] { 5, 10, 15 }));
+        using RHandle handle = await _supervisor.SetObjAsync(
+            RValue.OfDouble(new double[] { 5, 10, 15 }), TestContext.Current.CancellationToken);
 
-        RValue result = await _supervisor.CallAsync("sum", new RCallArgument[] { handle });
+        RValue result = await _supervisor.CallAsync(
+            "sum", new RCallArgument[] { handle }, TestContext.Current.CancellationToken);
 
         result.DoubleValues![0].Should().Be(30.0);
     }
@@ -80,7 +85,8 @@ public class EvalCallIntegrationTests
     [Fact]
     public async Task EvalAsync_ErroringExpression_ThrowsRErrorException_WithoutFaultingConnection()
     {
-        Func<Task> act = () => _supervisor.EvalAsync("stop('deliberate test error')");
+        Func<Task> act = () => _supervisor.EvalAsync(
+            "stop('deliberate test error')", TestContext.Current.CancellationToken);
 
         RErrorException error = (await act.Should().ThrowAsync<RErrorException>()).Which;
         error.Message.Should().Be("deliberate test error");
@@ -90,14 +96,15 @@ public class EvalCallIntegrationTests
         _supervisor.State.Should().Be(SupervisorState.Ready);
 
         // And the connection should still work for a subsequent call.
-        RValue result = await _supervisor.EvalAsync("1 + 1");
+        RValue result = await _supervisor.EvalAsync("1 + 1", TestContext.Current.CancellationToken);
         result.DoubleValues![0].Should().Be(2.0);
     }
 
     [Fact]
     public async Task CallAsync_UnknownFunction_ThrowsRErrorException_WithoutFaultingConnection()
     {
-        Func<Task> act = () => _supervisor.CallAsync("this_function_does_not_exist", Array.Empty<RCallArgument>());
+        Func<Task> act = () => _supervisor.CallAsync(
+            "this_function_does_not_exist", Array.Empty<RCallArgument>(), TestContext.Current.CancellationToken);
 
         await act.Should().ThrowAsync<RErrorException>();
 

@@ -406,3 +406,31 @@ not fully test-verified"; nothing gets a plain `[x]` until
   that's the mechanism to revisit (e.g. sort by `MetadataToken`
   explicitly, which is closer to a real guarantee than default
   reflection order).
+
+## Update: sln refresh + xUnit1051 cleanup
+
+- Adopted the user's updated `RWire.sln` (VS 18 tooling version, plus
+  solution folders for the loose root files, `r/worker.R`, and
+  `docs/*.md` — cosmetic/organizational, no project references
+  changed).
+- Fixed `warning xUnit1051` (cancellable async calls should use
+  `TestContext.Current.CancellationToken`) across every test file:
+  `StartAsync`, `EvalAsync`, `CallAsync`, `SetObjAsync`, `GetObjAsync`,
+  `CreateRefAsync`, `ReleaseRefAsync`, `RConnection.SendAsync`/
+  `ReceiveAsync`, `Task.Delay`, `TcpListener.AcceptTcpClientAsync`,
+  `TcpClient.ConnectAsync`, and `StreamReader.ReadToEndAsync` all now
+  thread the token through. `RTestthatSuiteTests`'s own 2-minute safety
+  timeout is now a `CancellationTokenSource` **linked** to
+  `TestContext.Current.CancellationToken` (via `CreateLinkedTokenSource`
+  + `CancelAfter`) rather than a bare timeout, so cancelling the test
+  run itself also cancels the R subprocess wait, not just the
+  self-imposed timeout.
+- **Not verified against a real compiler** — same standing caveat as
+  everything else this session. The one syntax worth double-checking
+  if this doesn't build: calls like
+  `client.SendAsync(MsgType.Call, correlationId: 9, payload, TestContext.Current.CancellationToken)`
+  mix a named argument (`correlationId: 9`) with positional arguments
+  before and after it — legal in C# since 7.2 ("non-trailing named
+  arguments") *because* the named argument sits in its own natural
+  parameter position, but worth a second look if the compiler
+  disagrees.

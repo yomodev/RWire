@@ -22,7 +22,7 @@ public sealed class RWireProcessFixture : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         Supervisor = new ProcessSupervisor(new RWireOptions { WorkerScriptPath = WorkerScriptPath });
-        await Supervisor.StartAsync();
+        await Supervisor.StartAsync(TestContext.Current.CancellationToken);
     }
 
     public ValueTask DisposeAsync()
