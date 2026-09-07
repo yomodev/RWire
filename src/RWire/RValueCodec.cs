@@ -44,6 +44,21 @@ public static class RValueCodec
             return;
         }
 
+        if (value.TypeTag == RTypeTag.SerializedBlob)
+        {
+            // Self-contained (docs/spec.md section 7) - serialize()
+            // already embeds the value's own attributes/class, so
+            // this is just [Length][Bytes], no attribute block.
+            byte[] bytes = value.SerializedBytes
+                ?? throw new InvalidOperationException("A SerializedBlob RValue must have SerializedBytes set.");
+            WriteInt32(writer, bytes.Length);
+            if (bytes.Length > 0)
+            {
+                writer.Write(bytes);
+            }
+            return;
+        }
+
         if (value.TypeTag == RTypeTag.Table)
         {
             WriteInt32(
@@ -189,10 +204,17 @@ public static class RValueCodec
             rowCount = ReadInt32(buffer, ref offset);
         }
 
-        int count = ReadInt32(buffer, ref offset); // column count for Table, element count otherwise
+        int count = ReadInt32(buffer, ref offset); // byte length for SerializedBlob, column count for Table, element count otherwise
         if (count < 0)
         {
             throw new InvalidDataException($"Negative element count: {count}.");
+        }
+
+        if (typeTag == RTypeTag.SerializedBlob)
+        {
+            // Self-contained (docs/spec.md section 7) - no ReadAttributes
+            // call, matching Encode's symmetric early return.
+            return RValue.OfSerializedBlob(ReadBytes(buffer, ref offset, count));
         }
 
         RValue value = typeTag switch

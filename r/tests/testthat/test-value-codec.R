@@ -114,3 +114,54 @@ test_that("zero-row data.frame round-trips", {
   expect_equal(nrow(result), 0)
   expect_equal(ncol(result), 2)
 })
+
+test_that("an environment round-trips via the serialize() cold path", {
+  original <- new.env()
+  original$x <- 42
+  original$label <- "hello"
+
+  result <- round_trip(original)
+
+  expect_true(is.environment(result))
+  expect_equal(result$x, 42)
+  expect_equal(result$label, "hello")
+})
+
+test_that("a closure round-trips via the serialize() cold path and still works", {
+  original <- function(x) x * 10
+
+  result <- round_trip(original)
+
+  expect_true(is.function(result))
+  expect_equal(result(4), 40)
+})
+
+test_that("a list containing a closure encodes the closure via the cold path, the rest normally", {
+  original <- list(1:3, function(x) x)
+
+  result <- round_trip(original)
+
+  expect_equal(result[[1]], 1:3)
+  expect_true(is.function(result[[2]]))
+  expect_equal(result[[2]](99), 99)
+})
+
+test_that("the cold path carries no separate attribute block on the wire", {
+  # Directly inspects the byte layout: [TypeTag(1)][Length(4)][bytes],
+  # nothing after it - unlike every other type, which always has at
+  # least the HasNames/HasDim/HasClass/AttrCount flag bytes trailing.
+  # Checked self-consistently (declared length vs. actual remaining
+  # bytes) rather than against a separately-serialized reference blob,
+  # since two independently-evaluated closure literals aren't
+  # guaranteed to serialize to identical byte lengths (srcref metadata
+  # can differ by source position).
+  con <- rawConnection(raw(0), "w")
+  write_r_value(con, function(x) x)
+  bytes <- rawConnectionValue(con)
+  close(con)
+
+  expect_equal(bytes[1], as.raw(RTAG_SERIALIZED_BLOB))
+
+  declared_length <- readBin(bytes[2:5], what = "integer", n = 1, size = 4, endian = "little")
+  expect_equal(length(bytes), 1L + 4L + declared_length)
+})

@@ -41,6 +41,21 @@ public sealed class RValue
     public RValue[]? ListValues { get; init; }
 
     /// <summary>
+    /// Cold-path payload (docs/spec.md section 7): the raw bytes of an
+    /// R serialize()-format blob for a value that doesn't fit any of
+    /// the other shapes here (S4 objects, environments, closures,
+    /// language objects, ...). Opaque to C# - there's no .NET-side
+    /// deserializer for R's serialize format, so this is meant to be
+    /// round-tripped unexamined (e.g. received from one R call and
+    /// passed back via SetObj/CALL to another) rather than inspected.
+    /// Self-contained on the wire: unlike every other type, a
+    /// SerializedBlob carries no separate attribute block, since
+    /// serialize() already embeds the value's attributes/class
+    /// internally.
+    /// </summary>
+    public byte[]? SerializedBytes { get; init; }
+
+    /// <summary>
     /// Row count for a Table (TypeTag == Table). Every entry in
     /// ListValues (the table's columns) must have exactly this many
     /// elements - docs/spec.md section 6.
@@ -69,6 +84,7 @@ public sealed class RValue
         RTypeTag.Raw => RawValues?.Length ?? 0,
         RTypeTag.List => ListValues?.Length ?? 0,
         RTypeTag.Table => ListValues?.Length ?? 0, // column count, matching Names' column-name count
+        RTypeTag.SerializedBlob => SerializedBytes?.Length ?? 0,
         _ => 0,
     };
 
@@ -79,6 +95,16 @@ public sealed class RValue
     public static RValue OfCharacter(string?[] values) => new() { TypeTag = RTypeTag.Character, CharacterValues = values };
     public static RValue OfRaw(byte[] values) => new() { TypeTag = RTypeTag.Raw, RawValues = values };
     public static RValue OfList(RValue[] values) => new() { TypeTag = RTypeTag.List, ListValues = values };
+
+    /// <summary>
+    /// Wraps opaque R serialize()-format bytes as a cold-path RValue
+    /// (docs/spec.md section 7). Typically produced by decoding a
+    /// value R's write_r_value fell back to serialize() for, and
+    /// consumed by round-tripping it back unexamined (C# has no
+    /// deserializer for this format) - see SerializedBytes' own doc
+    /// comment.
+    /// </summary>
+    public static RValue OfSerializedBlob(byte[] bytes) => new() { TypeTag = RTypeTag.SerializedBlob, SerializedBytes = bytes };
 
     /// <summary>
     /// Builds a Table RValue from named columns - the row count is

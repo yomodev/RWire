@@ -314,6 +314,57 @@ public class RValueCodecTests
         act.Should().Throw<InvalidDataException>();
     }
 
+    [Fact]
+    public void SerializedBlob_RoundTrips_AsOpaqueBytes()
+    {
+        // C# has no R-serialize-format deserializer, so this tests the
+        // wire *shape* (docs/spec.md section 7) with arbitrary opaque
+        // bytes - real R serialize() output round-trips through this
+        // codec identically, since it's never interpreted here.
+        byte[] fakeSerializedBytes = { 0x58, 0x0A, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03 };
+
+        RValue value = RValue.OfSerializedBlob(fakeSerializedBytes);
+        RValue result = RoundTrip(value);
+
+        result.TypeTag.Should().Be(RTypeTag.SerializedBlob);
+        result.SerializedBytes.Should().Equal(fakeSerializedBytes);
+        result.Length.Should().Be(fakeSerializedBytes.Length);
+    }
+
+    [Fact]
+    public void SerializedBlob_EmptyBytes_RoundTrips()
+    {
+        RValue result = RoundTrip(RValue.OfSerializedBlob(Array.Empty<byte>()));
+
+        result.TypeTag.Should().Be(RTypeTag.SerializedBlob);
+        result.SerializedBytes.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void SerializedBlob_CarriesNoAttributeBlock_UnlikeEveryOtherType()
+    {
+        // Confirms the self-contained wire shape directly: total
+        // encoded size is exactly [TypeTag(1)][Length(4)][bytes] - no
+        // trailing HasNames/HasDim/HasClass/AttrCount bytes the way
+        // every other non-Null type has.
+        byte[] bytes = { 1, 2, 3 };
+        var writer = new ArrayBufferWriter<byte>();
+        RValueCodec.Encode(writer, RValue.OfSerializedBlob(bytes));
+
+        writer.WrittenCount.Should().Be(1 + 4 + bytes.Length);
+    }
+
+    [Fact]
+    public void Encode_SerializedBlobWithoutBytesSet_Throws()
+    {
+        var incomplete = new RValue { TypeTag = RTypeTag.SerializedBlob };
+        var writer = new ArrayBufferWriter<byte>();
+
+        Action act = () => RValueCodec.Encode(writer, incomplete);
+
+        act.Should().Throw<InvalidOperationException>();
+    }
+
     private static void WriteInt32(IBufferWriter<byte> writer, int value)
     {
         Span<byte> span = writer.GetSpan(4);

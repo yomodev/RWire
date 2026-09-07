@@ -13,4 +13,5 @@ public enum RTypeTag : byte
     Raw = 5,
     List = 6,
     Table = 7,
+    SerializedBlob = 8,
 }

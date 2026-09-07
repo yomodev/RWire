@@ -175,7 +175,7 @@ directly rather than from spec.md.
 - [ ] Phase 2 — Atomic type mapping (hot path) (code written, unbuilt)
 - [ ] Phase 3 — Reference counting (code written, unbuilt)
 - [ ] Phase 4 — `TABLE` type & bulk transfer (code written, unbuilt; streaming optimization deferred - see above)
-- [ ] Phase 5 — Cold path (serialize/unserialize) + irregular lists
+- [ ] Phase 5 — Cold path (serialize/unserialize) + irregular lists (code written, unbuilt)
 - [ ] Phase 6 — Process supervision & resilience
 - [ ] Phase 7 — Performance hardening (now also owns: real TABLE streaming, and validating the "rewrite in C" question with actual profiling)
 
@@ -434,3 +434,33 @@ not fully test-verified"; nothing gets a plain `[x]` until
   arguments") *because* the named argument sits in its own natural
   parameter position, but worth a second look if the compiler
   disagrees.
+
+## Update: Phase 5 — cold path (serialize/unserialize)
+
+Picking the phase plan back up after the tooling/hardening detour.
+Full detail in `docs/phases/phase-5-cold-path.md`; summary:
+
+- `RTypeTag.SerializedBlob`, `RValue.SerializedBytes`/
+  `OfSerializedBlob`, and `RValueCodec` encode/decode with an early
+  return (no attribute block — self-contained, per spec.md §7).
+- `worker.R`'s `write_r_value`/`read_r_value` fallback branches
+  (previously `stop("unsupported type")`) now call `serialize()`/
+  `unserialize()` and return early, symmetric with the C# side.
+- Composes automatically with existing List/Table handling — no
+  special wiring needed for "a list containing one closure among
+  ordinary vectors."
+- New tests: 4 pure-C# `RValueCodecTests` cases, 4 R-side `testthat`
+  cases, and `ColdPathIntegrationTests.cs` (needs `Rscript`) — the
+  real proof is `SerializedBlob_RoundTripsThroughR_ViaSetObjAndCall`,
+  which sends a closure through `EVAL → SET_OBJ → CALL` and confirms
+  it's still a genuinely callable function afterward, not just
+  byte-identical.
+- **Deliberate, permanent scope boundary** (not a gap to close later):
+  C# never gets a deserializer for R's `serialize()` format.
+  `SerializedBytes` is meant to be shuttled between R calls unexamined
+  — inspecting it client-side was never the goal.
+- **Unverified, as with everything else this session** — no build has
+  been run against this. Priority order if debugging: pure C# codec
+  tests first, then `testthat` (isolates `write_r_value`/
+  `read_r_value` from the socket entirely), then the full integration
+  tests last.

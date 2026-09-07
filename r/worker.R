@@ -48,6 +48,7 @@ RTAG_CHARACTER <- 4L
 RTAG_RAW       <- 5L
 RTAG_LIST      <- 6L
 RTAG_TABLE     <- 7L
+RTAG_SERIALIZED_BLOB <- 8L
 
 # ---- Low-level primitive read/write helpers ------------------------
 
@@ -309,7 +310,19 @@ write_r_value <- function(con, x) {
     write_int32(con, length(x))
     if (length(x) > 0) writeBin(x, con)
   } else {
-    stop(sprintf("write_r_value: unsupported R type '%s'", typeof(x)))
+    # Cold path (docs/spec.md section 7): anything not covered by the
+    # fast-path branches above - S4 objects, environments, closures,
+    # language objects (calls/formulas/symbols), or any other R value
+    # this script has no dedicated mapping for. serialize() is
+    # self-describing (it embeds the value's own attributes/class
+    # internally), so this returns early rather than falling through
+    # to write_attributes() below - there is no separate attribute
+    # block for this type on the wire.
+    write_byte_value(con, RTAG_SERIALIZED_BLOB)
+    blob <- serialize(x, connection = NULL)
+    write_int32(con, length(blob))
+    if (length(blob) > 0) writeBin(blob, con)
+    return(invisible(NULL))
   }
 
   write_attributes(con, x, is_factor_value)
@@ -329,6 +342,15 @@ read_r_value <- function(con) {
   }
 
   n <- read_int32(con)
+
+  if (tag == RTAG_SERIALIZED_BLOB) {
+    # Self-contained (docs/spec.md section 7) - unserialize() already
+    # reconstructs the value's own attributes/class, so this returns
+    # directly rather than falling through to read_attributes() below,
+    # matching write_r_value's symmetric early return.
+    blob <- if (n > 0) readBin(con, what = "raw", n = n) else raw(0)
+    return(unserialize(blob))
+  }
 
   value <- if (tag == RTAG_LOGICAL) {
     raw_codes <- if (n > 0) {
