@@ -90,6 +90,60 @@ public class RConnectionTests : IAsyncLifetime
     }
 
     [Fact]
+    public void Send_LargePayload_RoundTrips()
+    {
+        // Phase 7: Send/SendAsync write the header and payload as two
+        // separate channel writes (avoiding a copy of the payload into
+        // a combined buffer) rather than one - this specifically
+        // checks that a payload large enough to span multiple TCP
+        // segments still round-trips correctly, i.e. that the
+        // receiver's ReadExact loop correctly reassembles it
+        // regardless of how many underlying writes/segments composed
+        // the stream.
+        (RConnection client, RConnection server) = MakeConnectionPair();
+
+        byte[] payload = new byte[5 * 1024 * 1024]; // 5 MB - well beyond a single typical TCP segment/buffer
+        new Random(7).NextBytes(payload);
+
+        // Send runs on a background thread concurrently with Receive()
+        // below: Send is synchronous/blocking, and a payload this size
+        // can exceed the OS socket send buffer - if nothing were
+        // draining the socket while Send blocked, this would deadlock
+        // rather than complete.
+        Task sendTask = Task.Run(() => client.Send(MsgType.Result, correlationId: 42, payload));
+
+        using Frame received = server.Receive();
+        sendTask.Wait(TestContext.Current.CancellationToken);
+
+        received.MsgType.Should().Be(MsgType.Result);
+        received.CorrelationId.Should().Be(42u);
+        received.Payload.ToArray().Should().Equal(payload);
+    }
+
+    [Fact]
+    public async Task SendAsync_LargePayload_RoundTrips()
+    {
+        (RConnection client, RConnection server) = MakeConnectionPair();
+
+        byte[] payload = new byte[5 * 1024 * 1024];
+        new Random(11).NextBytes(payload);
+
+        // Same concurrency requirement as the sync test above - run
+        // both sides at once rather than awaiting the send fully
+        // before starting the receive.
+        Task sendTask = client.SendAsync(
+            MsgType.Result, correlationId: 43, payload, TestContext.Current.CancellationToken).AsTask();
+        Task<Frame> receiveTask = server.ReceiveAsync(TestContext.Current.CancellationToken).AsTask();
+
+        await Task.WhenAll(sendTask, receiveTask);
+
+        using Frame received = await receiveTask;
+        received.MsgType.Should().Be(MsgType.Result);
+        received.CorrelationId.Should().Be(43u);
+        received.Payload.ToArray().Should().Equal(payload);
+    }
+
+    [Fact]
     public void Receive_AfterChannelClosed_ThrowsEndOfStream()
     {
         (RConnection client, RConnection server) = MakeConnectionPair();

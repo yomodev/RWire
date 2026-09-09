@@ -23,7 +23,8 @@ public sealed class RWireOptions
 
     /// <summary>
     /// How long to wait for the R process to connect back and send a
-    /// valid HELLO frame before treating startup as failed.
+    /// valid HELLO frame before treating startup (or a restart
+    /// attempt) as failed.
     /// </summary>
     public TimeSpan HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
@@ -36,13 +37,40 @@ public sealed class RWireOptions
     /// <summary>How often to send a PING while the connection is idle (State == Ready).</summary>
     public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long to wait for a PONG before treating the connection as Faulted.</summary>
+    /// <summary>How long to wait for a PONG before treating the connection as faulted.</summary>
     public TimeSpan HeartbeatResponseTimeout { get; init; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Maximum number of automatic restart attempts after a fault
+    /// (docs/spec.md section 3.4) before giving up permanently. Each
+    /// attempt is preceded by an exponential backoff delay - see
+    /// InitialRestartDelay/MaxRestartDelay.
+    /// </summary>
+    public int MaxRestartAttempts { get; init; } = 5;
+
+    /// <summary>Delay before the first restart attempt; doubles each subsequent attempt up to MaxRestartDelay.</summary>
+    public TimeSpan InitialRestartDelay { get; init; } = TimeSpan.FromMilliseconds(200);
+
+    /// <summary>Upper bound on the exponential backoff delay between restart attempts.</summary>
+    public TimeSpan MaxRestartDelay { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long a call (Eval/Call/GetObj/...) will block waiting for
+    /// an in-progress automatic restart to settle before giving up and
+    /// throwing. This is what makes "the supervisor recovers
+    /// automatically for the next call" (docs/spec.md section 11,
+    /// Phase 6 exit criteria) transparent to ordinary callers instead
+    /// of requiring them to catch a Restarting-state exception and
+    /// retry manually.
+    /// </summary>
+    public TimeSpan RestartWaitTimeout { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>How many recent stdout/stderr lines to retain for correlating with a fault (docs/spec.md section 11, Phase 6: "log correlation with the failure event").</summary>
+    public int RecentDiagnosticLineCapacity { get; init; } = 20;
 }
 
 /// <summary>
-/// Phase 1 subset of the full lifecycle state machine (docs/spec.md
-/// section 3.2). Restarting/backoff arrive in Phase 6.
+/// Full lifecycle state machine (docs/spec.md section 3.2).
 /// </summary>
 public enum SupervisorState
 {
@@ -51,69 +79,110 @@ public enum SupervisorState
     Ready,
     Busy,
     Faulted,
+    Restarting,
     Disposed,
 }
 
 /// <summary>
 /// Launches the R worker process, performs the real HELLO handshake
 /// over the frame protocol, keeps the connection alive with a
-/// PING/PONG heartbeat, and shuts the worker down gracefully (or
-/// force-kills it) on Dispose.
+/// PING/PONG heartbeat, automatically restarts the worker (with
+/// exponential backoff) if it crashes or stops responding, and shuts
+/// it down gracefully (or force-kills it) on Dispose.
 ///
-/// Does not yet implement reference counting (Phase 3), EVAL/CALL
-/// (Phase 2), the full restart-on-crash state machine (Phase 6), or
-/// TABLE transfer (Phase 4).
+/// Restart is transparent to callers: EnsureReady() (invoked by every
+/// Eval/Call/GetObj/... method) blocks briefly for an in-progress
+/// restart to settle rather than immediately rejecting the call, so a
+/// caller that happens to call in right after a crash generally just
+/// sees a short delay rather than an exception - see
+/// RWireOptions.RestartWaitTimeout. A call that is itself in flight
+/// when the crash happens still fails with a clear exception (docs/
+/// spec.md section 11, Phase 6 exit criteria) rather than being
+/// silently retried - only the *next* call benefits from the
+/// already-recovered connection.
 ///
-/// See docs/phases/phase-1-channel-protocol.md for the checklist this
-/// class implements against.
+/// A successful restart gets a new SessionId, so RHandles created
+/// before the restart are correctly rejected afterward (ValidateHandle
+/// already checks this - see RHandle's doc comment) without any
+/// restart-specific handle-invalidation logic being needed.
+///
+/// See docs/phases/phase-6-process-supervision.md for the checklist
+/// this class implements against.
 /// </summary>
 public sealed class ProcessSupervisor : IDisposable
 {
     private static long _nextSessionId;
 
     private readonly RWireOptions _options;
-    private readonly Process _process;
-    private readonly IRChannelListener _channelListener;
-    private readonly string _token;
+    private readonly Func<IRChannelListener> _channelListenerFactory;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly object _recentDiagnosticsLock = new();
+    private readonly Queue<string> _recentDiagnostics = new();
 
+    private Process _process;
+    private IRChannelListener _channelListener;
+    private string _token;
     private RConnection? _connection;
     private CancellationTokenSource? _heartbeatCts;
     private Task? _heartbeatLoopTask;
     private Task? _stdoutPumpTask;
     private Task? _stderrPumpTask;
+    private int _restartGate; // Interlocked guard: 0 = idle, 1 = a restart loop is running
     private bool _disposed;
 
     public SupervisorState State { get; private set; } = SupervisorState.NotStarted;
 
     /// <summary>
-    /// Identifies this process's session. RHandles are stamped with
-    /// the SessionId of the supervisor that created them - using one
-    /// after a (future Phase 6) restart, when this would change,
-    /// throws rather than silently addressing a new process's
-    /// registry with a stale id. Fixed for the lifetime of this
-    /// instance today, since Phase 6's restart logic doesn't exist
-    /// yet - the field exists now so handles are already
-    /// restart-safe by construction once it does.
+    /// Identifies the current process session. RHandles are stamped
+    /// with the SessionId active when they were created; using one
+    /// after a restart (when this changes) throws rather than
+    /// silently addressing the new process's registry with a stale id
+    /// - see RHandle's and ValidateHandle's doc comments.
     /// </summary>
-    public ulong SessionId { get; } = (ulong)Interlocked.Increment(ref _nextSessionId);
+    public ulong SessionId { get; private set; }
 
-    /// <summary>The ephemeral loopback port (or other listener-defined value) the R process was told to connect back to.</summary>
-    public int Port { get; }
+    /// <summary>The ephemeral loopback port (or other listener-defined value) the current R process was told to connect back to. Changes across restarts.</summary>
+    public int Port { get; private set; }
 
-    /// <summary>The R version string reported in the HELLO frame, populated after StartAsync completes.</summary>
+    /// <summary>The R version string reported in the HELLO frame, populated after StartAsync (or a restart) completes.</summary>
     public string? RVersion { get; private set; }
 
     /// <summary>
     /// The process's exit code, populated once Dispose has confirmed
-    /// the process has actually exited. Null before that. Exists so
-    /// callers/tests can check exit status without touching the
-    /// underlying Process object after Dispose has released it -
+    /// the (current) process has actually exited. Null before that.
+    /// Exists so callers/tests can check exit status without touching
+    /// the underlying Process object after Dispose has released it -
     /// Process throws InvalidOperationException ("No process is
     /// associated with this object") if its properties are accessed
     /// post-Dispose, so this is captured proactively instead.
     /// </summary>
     public int? ExitCode { get; private set; }
+
+    /// <summary>How many restart attempts have completed successfully over this instance's lifetime.</summary>
+    public int RestartCount { get; private set; }
+
+    /// <summary>True once MaxRestartAttempts has been exhausted without a successful restart - State stays Faulted permanently at that point; no further automatic restarts will be attempted.</summary>
+    public bool IsPermanentlyFailed { get; private set; }
+
+    /// <summary>The exception that most recently caused a fault (an unexpected process exit, a heartbeat timeout, or a failed call) - null if nothing has faulted yet.</summary>
+    public Exception? LastFault { get; private set; }
+
+    /// <summary>
+    /// The most recent stdout/stderr lines (bounded by
+    /// RWireOptions.RecentDiagnosticLineCapacity), for correlating
+    /// with a fault after the fact (docs/spec.md section 11, Phase 6).
+    /// </summary>
+    public IReadOnlyList<string> RecentDiagnosticOutput
+    {
+        get
+        {
+            lock (_recentDiagnosticsLock)
+            {
+                return _recentDiagnostics.ToArray();
+            }
+        }
+    }
 
     /// <summary>
     /// Raised for every line the R process writes to stdout or
@@ -121,32 +190,40 @@ public sealed class ProcessSupervisor : IDisposable
     /// dedicated async ReadLineAsync loops (not the
     /// BeginOutputReadLine/OutputDataReceived event pattern) so
     /// Dispose can deterministically await both streams draining
-    /// fully rather than guessing with a fixed delay. Phase 6 adds
-    /// fatal-signature scanning as a secondary crash-detection signal
-    /// on top of this.
+    /// fully rather than guessing with a fixed delay.
     /// </summary>
     public event Action<string, bool>? DiagnosticOutput;
 
-    /// <summary>Exposed for test purposes only (see AssemblyInfo.cs's InternalsVisibleTo).</summary>
+    /// <summary>Exposed for test purposes only (see AssemblyInfo.cs's InternalsVisibleTo). Reflects whichever process is currently active - reassigned across restarts.</summary>
     internal Process ProcessForTesting => _process;
 
     /// <summary>Uses the default TCP loopback channel listener.</summary>
-    public ProcessSupervisor(RWireOptions options) : this(options, new TcpRChannelListener())
+    public ProcessSupervisor(RWireOptions options) : this(options, static () => new TcpRChannelListener())
     {
     }
 
     /// <summary>
-    /// Uses the given channel listener instead of the default TCP one -
-    /// the extension point for tests or for a future non-socket
-    /// channel. ProcessSupervisor never constructs a TcpListener/
-    /// TcpClient itself; it only depends on IRChannelListener.
+    /// Uses channelListenerFactory to create a fresh IRChannelListener
+    /// for the initial launch and for every subsequent restart - a
+    /// factory (not a single instance) because a listener generally
+    /// can't be reused once its connection has been accepted and
+    /// disposed. This is the extension point for tests or for a
+    /// future non-socket channel. ProcessSupervisor never constructs a
+    /// TcpListener/TcpClient itself; it only depends on
+    /// IRChannelListener.
     /// </summary>
-    public ProcessSupervisor(RWireOptions options, IRChannelListener channelListener)
+    public ProcessSupervisor(RWireOptions options, Func<IRChannelListener> channelListenerFactory)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        _channelListener = channelListener ?? throw new ArgumentNullException(nameof(channelListener));
-        _token = Guid.NewGuid().ToString("N");
+        _channelListenerFactory = channelListenerFactory ?? throw new ArgumentNullException(nameof(channelListenerFactory));
+        (_process, _channelListener, _token) = CreateProcessAndListener();
         Port = _channelListener.Port;
+    }
+
+    private (Process Process, IRChannelListener Listener, string Token) CreateProcessAndListener()
+    {
+        string token = Guid.NewGuid().ToString("N");
+        IRChannelListener listener = _channelListenerFactory();
 
         var startInfo = new ProcessStartInfo
         {
@@ -158,32 +235,48 @@ public sealed class ProcessSupervisor : IDisposable
         };
         startInfo.ArgumentList.Add(_options.WorkerScriptPath);
         startInfo.ArgumentList.Add("--channel=socket");
-        startInfo.ArgumentList.Add($"--port={Port}");
-        startInfo.ArgumentList.Add($"--token={_token}");
+        startInfo.ArgumentList.Add($"--port={listener.Port}");
+        startInfo.ArgumentList.Add($"--token={token}");
 
-        _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        _process.Exited += (_, _) =>
+        var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        process.Exited += (_, _) => OnProcessExited();
+
+        return (process, listener, token);
+    }
+
+    private void OnProcessExited()
+    {
+        if (State is SupervisorState.Starting or SupervisorState.Ready or SupervisorState.Busy)
         {
-            if (State is SupervisorState.Starting or SupervisorState.Ready or SupervisorState.Busy)
-            {
-                State = SupervisorState.Faulted;
-            }
-        };
+            Fault(new InvalidOperationException(
+                "The R worker process exited unexpectedly. Recent output:\n" +
+                string.Join('\n', RecentDiagnosticOutput)));
+        }
     }
 
     /// <summary>
     /// Reads lines from reader and raises DiagnosticOutput for each,
     /// until EOF (the process closed the stream, normally because it
-    /// exited). Runs as a background task started right after
-    /// Process.Start() so early output - including from a process
-    /// that fails almost immediately - is captured well before any
-    /// caller gets around to checking DiagnosticOutput.
+    /// exited). Also feeds RecentDiagnosticOutput's bounded history.
+    /// Runs as a background task started right after Process.Start()
+    /// so early output - including from a process that fails almost
+    /// immediately - is captured well before any caller gets around to
+    /// checking DiagnosticOutput.
     /// </summary>
     private async Task PumpStreamAsync(TextReader reader, bool isError)
     {
         string? line;
         while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) is not null)
         {
+            lock (_recentDiagnosticsLock)
+            {
+                _recentDiagnostics.Enqueue(line);
+                while (_recentDiagnostics.Count > _options.RecentDiagnosticLineCapacity)
+                {
+                    _recentDiagnostics.Dequeue();
+                }
+            }
+
             DiagnosticOutput?.Invoke(line, isError);
         }
     }
@@ -192,7 +285,12 @@ public sealed class ProcessSupervisor : IDisposable
     /// Starts the R process, waits for it to connect back, validates
     /// the HELLO handshake, and starts the heartbeat loop. Throws if
     /// the process fails to launch, never connects/sends HELLO within
-    /// HandshakeTimeout, or the handshake token doesn't match.
+    /// HandshakeTimeout, or the handshake token doesn't match. Unlike
+    /// a later automatic restart, a failure here is never retried -
+    /// if Rscript itself can't be found, or the worker script path is
+    /// wrong, retrying with the same (broken) configuration wouldn't
+    /// help; the caller finds out immediately instead of waiting
+    /// through MaxRestartAttempts' worth of backoff first.
     /// </summary>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -204,6 +302,27 @@ public sealed class ProcessSupervisor : IDisposable
 
         State = SupervisorState.Starting;
 
+        try
+        {
+            await LaunchAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            State = SupervisorState.Faulted;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The shared core of "start the currently-assigned _process,
+    /// accept its connect-back, complete the HELLO handshake, start
+    /// the heartbeat loop" - used by both the initial StartAsync and
+    /// every automatic restart attempt. Does not itself set State on
+    /// failure or catch exceptions; StartAsync and RestartLoopAsync
+    /// each handle that differently (throw immediately vs. retry).
+    /// </summary>
+    private async Task LaunchAsync(CancellationToken cancellationToken)
+    {
         bool started;
         try
         {
@@ -211,14 +330,12 @@ public sealed class ProcessSupervisor : IDisposable
         }
         catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
             throw new InvalidOperationException(
                 $"Failed to start '{_options.RScriptPath}'. Is Rscript on PATH?", ex);
         }
 
         if (!started)
         {
-            State = SupervisorState.Faulted;
             throw new InvalidOperationException("Process.Start returned false.");
         }
 
@@ -236,10 +353,9 @@ public sealed class ProcessSupervisor : IDisposable
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
-            State = SupervisorState.Faulted;
             throw new TimeoutException(
-                $"Timed out after {_options.HandshakeTimeout} waiting for the R worker " +
-                "to connect back. Check stderr via DiagnosticOutput for R-side errors.");
+                $"Timed out after {_options.HandshakeTimeout} waiting for the R worker to connect back. " +
+                $"Recent output:\n{string.Join('\n', RecentDiagnosticOutput)}");
         }
 
         _connection = new RConnection(channel);
@@ -250,16 +366,11 @@ public sealed class ProcessSupervisor : IDisposable
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
-            State = SupervisorState.Faulted;
             throw new TimeoutException(
                 $"Timed out after {_options.HandshakeTimeout} waiting for the HELLO frame.");
         }
-        catch
-        {
-            State = SupervisorState.Faulted;
-            throw;
-        }
 
+        SessionId = (ulong)Interlocked.Increment(ref _nextSessionId);
         State = SupervisorState.Ready;
 
         _heartbeatCts = new CancellationTokenSource();
@@ -291,65 +402,122 @@ public sealed class ProcessSupervisor : IDisposable
         RVersion = rVersion;
     }
 
+    // -----------------------------------------------------------------
+    // Automatic restart (docs/spec.md sections 3.4, 11 Phase 6)
+    // -----------------------------------------------------------------
+
     /// <summary>
-    /// Sends a PING and awaits a PONG on the configured interval while
-    /// State == Ready. Skips a tick (rather than blocking) if the
-    /// connection is already in use by an application call, since a
-    /// call in flight is itself evidence the connection is alive - see
-    /// docs/spec.md section 3.3 and the non-goal of concurrent
-    /// pipelining in section 1.2.
+    /// Records cause as the current fault and, unless a restart is
+    /// already underway or the supervisor is disposed, transitions to
+    /// Restarting and kicks off the background restart loop. Safe to
+    /// call from multiple places observing the same underlying failure
+    /// (the heartbeat loop, Process.Exited, and an in-flight call's
+    /// own catch block can all race to report the same crash) - only
+    /// one restart loop ever runs at a time.
     /// </summary>
-    private async Task HeartbeatLoopAsync(CancellationToken ct)
+    private void Fault(Exception cause)
     {
-        using var timer = new PeriodicTimer(_options.HeartbeatInterval);
+        LastFault = cause;
 
-        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+        if (_disposed)
         {
-            if (State != SupervisorState.Ready)
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _restartGate, 1, 0) != 0)
+        {
+            // A restart is already in progress from another trigger -
+            // just make sure State reflects it.
+            State = SupervisorState.Restarting;
+            return;
+        }
+
+        State = SupervisorState.Restarting;
+        _ = Task.Run(RestartLoopAsync);
+    }
+
+    private async Task RestartLoopAsync()
+    {
+        try
+        {
+            for (int attempt = 1; attempt <= _options.MaxRestartAttempts && !_disposed; attempt++)
             {
-                continue;
-            }
-
-            if (!await _connectionLock.WaitAsync(0, ct).ConfigureAwait(false))
-            {
-                continue;
-            }
-
-            try
-            {
-                uint correlationId = _connection!.NextCorrelationId();
-                await _connection.SendAsync(MsgType.Ping, correlationId, ReadOnlyMemory<byte>.Empty, ct)
-                    .ConfigureAwait(false);
-
-                using var responseTimeoutCts = new CancellationTokenSource(_options.HeartbeatResponseTimeout);
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, responseTimeoutCts.Token);
-
-                using Frame response = await _connection.ReceiveAsync(linked.Token).ConfigureAwait(false);
-                if (response.MsgType != MsgType.Pong)
+                TimeSpan delay = ComputeBackoffDelay(attempt);
+                try
                 {
-                    throw new InvalidOperationException(
-                        $"Expected PONG in response to a heartbeat PING, got {response.MsgType}.");
+                    await Task.Delay(delay, _lifetimeCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return; // disposed mid-backoff
+                }
+
+                try
+                {
+                    CleanupForRestart();
+                    (_process, _channelListener, _token) = CreateProcessAndListener();
+                    Port = _channelListener.Port;
+                    await LaunchAsync(_lifetimeCts.Token).ConfigureAwait(false);
+                    RestartCount++;
+                    return; // LaunchAsync already set State = Ready
+                }
+                catch (Exception ex)
+                {
+                    LastFault = ex;
                 }
             }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+
+            if (!_disposed)
             {
-                // Heartbeat-specific timeout (responseTimeoutCts), not
-                // supervisor shutdown - the connection is unresponsive.
+                IsPermanentlyFailed = true;
                 State = SupervisorState.Faulted;
             }
-            catch (OperationCanceledException)
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _restartGate, 0);
+        }
+    }
+
+    private TimeSpan ComputeBackoffDelay(int attempt)
+    {
+        double multiplier = Math.Pow(2, attempt - 1);
+        double delayMs = _options.InitialRestartDelay.TotalMilliseconds * multiplier;
+        double cappedMs = Math.Min(delayMs, _options.MaxRestartDelay.TotalMilliseconds);
+        return TimeSpan.FromMilliseconds(cappedMs);
+    }
+
+    /// <summary>Tears down everything associated with the current (failed) process/connection before a restart attempt builds fresh ones. Every step is best-effort - the objects being cleaned up are already known-broken.</summary>
+    private void CleanupForRestart()
+    {
+        try { _heartbeatCts?.Cancel(); } catch { /* best-effort */ }
+        try { _connection?.Dispose(); } catch { /* best-effort */ }
+        try { _channelListener.Dispose(); } catch { /* best-effort */ }
+        try
+        {
+            if (!_process.HasExited)
             {
-                // Supervisor is disposing - exit the loop quietly.
-                return;
+                _process.Kill(entireProcessTree: true);
             }
-            catch
-            {
-                State = SupervisorState.Faulted;
-            }
-            finally
-            {
-                _connectionLock.Release();
-            }
+        }
+        catch { /* best-effort */ }
+        try { _process.Dispose(); } catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// Blocks (bounded by RWireOptions.RestartWaitTimeout) while
+    /// State == Restarting, so an ordinary call made shortly after a
+    /// crash generally just waits briefly rather than throwing - see
+    /// this class's own doc comment for why this is a synchronous
+    /// poll rather than a proper async wait (used from both the sync
+    /// and async call surfaces).
+    /// </summary>
+    private void WaitForRestartToSettle()
+    {
+        DateTime deadline = DateTime.UtcNow + _options.RestartWaitTimeout;
+        while (State == SupervisorState.Restarting && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(25);
         }
     }
 
@@ -361,28 +529,39 @@ public sealed class ProcessSupervisor : IDisposable
 
     /// <summary>
     /// Rejects genuinely unusable states before a caller queues on
-    /// _connectionLock. Deliberately does NOT reject Busy: Busy means
-    /// "another call is currently using the connection", which is a
-    /// normal, transient condition for any concurrent caller to
+    /// _connectionLock. Waits out an in-progress restart first (see
+    /// WaitForRestartToSettle) rather than treating Restarting as an
+    /// immediate rejection. Deliberately does NOT reject Busy: Busy
+    /// means "another call is currently using the connection", which
+    /// is a normal, transient condition for any concurrent caller to
     /// observe - the connection lock below is what serializes actual
     /// access, so a concurrent caller should queue and wait its turn,
     /// not be thrown at just because it happened to check State while
-    /// someone else's request was in flight. Bug found via a real test
-    /// failure (a background handle-release racing a foreground EVAL
-    /// diagnostic call): treating Busy as a rejection meant a
-    /// perfectly valid, merely-waiting request got turned away.
+    /// someone else's request was in flight.
     /// </summary>
     private void EnsureReady()
     {
+        if (State == SupervisorState.Restarting)
+        {
+            WaitForRestartToSettle();
+        }
+
         switch (State)
         {
             case SupervisorState.Ready:
             case SupervisorState.Busy:
                 return;
             case SupervisorState.Faulted:
-                throw new InvalidOperationException("Cannot make a call: the connection is Faulted.");
+                throw new InvalidOperationException(
+                    IsPermanentlyFailed
+                        ? $"Cannot make a call: the connection failed permanently after " +
+                          $"{_options.MaxRestartAttempts} restart attempts. Last fault: {LastFault?.Message}"
+                        : $"Cannot make a call: the connection is Faulted. Last fault: {LastFault?.Message}");
             case SupervisorState.Disposed:
                 throw new ObjectDisposedException(nameof(ProcessSupervisor));
+            case SupervisorState.Restarting:
+                throw new TimeoutException(
+                    $"Timed out after {_options.RestartWaitTimeout} waiting for an in-progress restart to settle.");
             default:
                 throw new InvalidOperationException(
                     $"Cannot make a call before StartAsync has completed (current state: {State}).");
@@ -393,7 +572,7 @@ public sealed class ProcessSupervisor : IDisposable
     /// Evaluates an arbitrary R expression and returns its value.
     /// Throws RErrorException for a caught R-side error (connection
     /// stays healthy) or other exceptions for a protocol/connection
-    /// failure (connection is marked Faulted).
+    /// failure (triggers an automatic restart - see Fault).
     /// </summary>
     public RValue Eval(string expression)
     {
@@ -403,7 +582,7 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            _connection.Send(MsgType.Eval, correlationId, EncodeEvalPayload(expression));
+            _connection.Send(MsgType.Eval, correlationId, EncodeEvalPayload(expression).WrittenSpan);
             using Frame response = _connection.Receive();
             RValue result = DecodeResponse(response);
             State = SupervisorState.Ready;
@@ -414,9 +593,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -434,7 +613,7 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            await _connection.SendAsync(MsgType.Eval, correlationId, EncodeEvalPayload(expression), ct)
+            await _connection.SendAsync(MsgType.Eval, correlationId, EncodeEvalPayload(expression).WrittenMemory, ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
             RValue result = DecodeResponse(response);
@@ -446,9 +625,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -457,11 +636,6 @@ public sealed class ProcessSupervisor : IDisposable
         }
     }
 
-    /// <summary>
-    /// Invokes a named R function with the given arguments (all
-    /// inline values in Phase 2 - handle-typed arguments arrive in
-    /// Phase 3) and returns its value.
-    /// </summary>
     /// <summary>
     /// Invokes a named R function with the given arguments - each
     /// argument is either an inline RValue or an RHandle (implicitly
@@ -477,7 +651,7 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            _connection.Send(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments));
+            _connection.Send(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments).WrittenSpan);
             using Frame response = _connection.Receive();
             RValue result = DecodeResponse(response);
             State = SupervisorState.Ready;
@@ -488,9 +662,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -511,7 +685,7 @@ public sealed class ProcessSupervisor : IDisposable
         {
             uint correlationId = _connection!.NextCorrelationId();
             await _connection
-                .SendAsync(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments), ct)
+                .SendAsync(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments).WrittenMemory, ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
             RValue result = DecodeResponse(response);
@@ -523,9 +697,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -594,9 +768,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -627,9 +801,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -661,9 +835,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -694,9 +868,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -728,9 +902,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -761,9 +935,9 @@ public sealed class ProcessSupervisor : IDisposable
             State = SupervisorState.Ready;
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -808,9 +982,9 @@ public sealed class ProcessSupervisor : IDisposable
             }
             throw;
         }
-        catch
+        catch (Exception ex)
         {
-            State = SupervisorState.Faulted;
+            Fault(ex);
             throw;
         }
         finally
@@ -882,14 +1056,14 @@ public sealed class ProcessSupervisor : IDisposable
         }
     }
 
-    private static byte[] EncodeEvalPayload(string expression)
+    private static ArrayBufferWriter<byte> EncodeEvalPayload(string expression)
     {
         var writer = new ArrayBufferWriter<byte>();
         WireStrings.Write(writer, expression);
-        return writer.WrittenSpan.ToArray();
+        return writer;
     }
 
-    private static byte[] EncodeCallPayload(string functionName, IReadOnlyList<RCallArgument> arguments)
+    private static ArrayBufferWriter<byte> EncodeCallPayload(string functionName, IReadOnlyList<RCallArgument> arguments)
     {
         var writer = new ArrayBufferWriter<byte>();
         WireStrings.Write(writer, functionName);
@@ -917,7 +1091,7 @@ public sealed class ProcessSupervisor : IDisposable
             }
         }
 
-        return writer.WrittenSpan.ToArray();
+        return writer;
     }
 
     private static RValue DecodeResponse(Frame response)
@@ -972,7 +1146,8 @@ public sealed class ProcessSupervisor : IDisposable
     /// <summary>
     /// Sends a graceful SHUTDOWN, closes the connection, and waits up
     /// to ShutdownGracePeriod for the process to exit before
-    /// force-killing it. Safe to call multiple times.
+    /// force-killing it. Also stops any in-progress or future
+    /// automatic restart. Safe to call multiple times.
     /// </summary>
     public void Dispose()
     {
@@ -984,6 +1159,7 @@ public sealed class ProcessSupervisor : IDisposable
         _disposed = true;
         State = SupervisorState.Disposed;
 
+        _lifetimeCts.Cancel(); // unblocks a RestartLoopAsync sitting in its backoff delay
         _heartbeatCts?.Cancel();
 
         try
@@ -1074,7 +1250,72 @@ public sealed class ProcessSupervisor : IDisposable
         }
 
         _heartbeatCts?.Dispose();
+        _lifetimeCts.Dispose();
         _connectionLock.Dispose();
         _process.Dispose();
+    }
+
+    /// <summary>
+    /// Sends a PING and awaits a PONG on the configured interval while
+    /// State == Ready. Skips a tick (rather than blocking) if the
+    /// connection is already in use by an application call, since a
+    /// call in flight is itself evidence the connection is alive - see
+    /// docs/spec.md section 3.3 and the non-goal of concurrent
+    /// pipelining in section 1.2. A timeout or error here reports the
+    /// fault through the same Fault() path everything else uses,
+    /// triggering an automatic restart.
+    /// </summary>
+    private async Task HeartbeatLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(_options.HeartbeatInterval);
+
+        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+        {
+            if (State != SupervisorState.Ready)
+            {
+                continue;
+            }
+
+            if (!await _connectionLock.WaitAsync(0, ct).ConfigureAwait(false))
+            {
+                continue;
+            }
+
+            try
+            {
+                uint correlationId = _connection!.NextCorrelationId();
+                await _connection.SendAsync(MsgType.Ping, correlationId, ReadOnlyMemory<byte>.Empty, ct)
+                    .ConfigureAwait(false);
+
+                using var responseTimeoutCts = new CancellationTokenSource(_options.HeartbeatResponseTimeout);
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, responseTimeoutCts.Token);
+
+                using Frame response = await _connection.ReceiveAsync(linked.Token).ConfigureAwait(false);
+                if (response.MsgType != MsgType.Pong)
+                {
+                    throw new InvalidOperationException(
+                        $"Expected PONG in response to a heartbeat PING, got {response.MsgType}.");
+                }
+            }
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                // Heartbeat-specific timeout (responseTimeoutCts), not
+                // supervisor shutdown - the connection is unresponsive.
+                Fault(ex);
+            }
+            catch (OperationCanceledException)
+            {
+                // Supervisor is disposing - exit the loop quietly.
+                return;
+            }
+            catch (Exception ex)
+            {
+                Fault(ex);
+            }
+            finally
+            {
+                _connectionLock.Release();
+            }
+        }
     }
 }

@@ -28,16 +28,22 @@ public sealed class RConnection : IDisposable
 
     public void Send(MsgType msgType, uint correlationId, ReadOnlySpan<byte> payload)
     {
-        int total = FrameCodec.TotalSize(payload.Length);
-        byte[] rented = ArrayPool<byte>.Shared.Rent(total);
-        try
+        // Two separate writes (header, then payload) rather than
+        // copying payload into one combined buffer first - the
+        // payload is often already materialized elsewhere (e.g. an
+        // ArrayBufferWriter<byte> from RValueCodec.Encode), so this
+        // avoids an extra copy of it on every send. Safe at the
+        // transport level: the receiver's ReadExact loop reads exactly
+        // the declared byte count regardless of how many underlying
+        // writes composed the stream (docs/spec.md section 9 /
+        // docs/phases/phase-7-performance-hardening.md).
+        Span<byte> header = stackalloc byte[FrameCodec.LengthPrefixSize + FrameCodec.FixedHeaderSize];
+        int written = FrameCodec.EncodeHeaderOnly(header, msgType, correlationId, payload.Length);
+        _channel.Write(header.Slice(0, written));
+
+        if (payload.Length > 0)
         {
-            int written = FrameCodec.EncodeFrame(rented, msgType, correlationId, payload);
-            _channel.Write(rented.AsSpan(0, written));
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rented);
+            _channel.Write(payload);
         }
     }
 
@@ -85,16 +91,23 @@ public sealed class RConnection : IDisposable
     public async ValueTask SendAsync(
         MsgType msgType, uint correlationId, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
     {
-        int total = FrameCodec.TotalSize(payload.Length);
-        byte[] rented = ArrayPool<byte>.Shared.Rent(total);
+        // Same two-write approach as the sync Send above - see its
+        // comment. A small pooled buffer is used here instead of
+        // stackalloc since a Span can't cross an await boundary.
+        byte[] headerBuffer = ArrayPool<byte>.Shared.Rent(FrameCodec.LengthPrefixSize + FrameCodec.FixedHeaderSize);
         try
         {
-            int written = FrameCodec.EncodeFrame(rented, msgType, correlationId, payload.Span);
-            await _channel.WriteAsync(rented.AsMemory(0, written), ct).ConfigureAwait(false);
+            int written = FrameCodec.EncodeHeaderOnly(headerBuffer, msgType, correlationId, payload.Length);
+            await _channel.WriteAsync(headerBuffer.AsMemory(0, written), ct).ConfigureAwait(false);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            ArrayPool<byte>.Shared.Return(headerBuffer);
+        }
+
+        if (payload.Length > 0)
+        {
+            await _channel.WriteAsync(payload, ct).ConfigureAwait(false);
         }
     }
 

@@ -59,6 +59,40 @@ public static class FrameCodec
     }
 
     /// <summary>
+    /// Encodes just the length-prefix + fixed header (no payload
+    /// bytes) for a payload of the given length, letting the caller
+    /// write the payload directly to the transport afterward instead
+    /// of copying it into the same buffer as the header first. This
+    /// is what lets RConnection avoid an extra copy of the (often
+    /// already-materialized-elsewhere, e.g. from an
+    /// ArrayBufferWriter&lt;byte&gt;) payload on every send - see
+    /// docs/spec.md section 9 / docs/phases/phase-7-performance-hardening.md.
+    /// destination must be at least LengthPrefixSize + FixedHeaderSize
+    /// bytes. Returns the number of header bytes written.
+    /// </summary>
+    public static int EncodeHeaderOnly(
+        Span<byte> destination, MsgType msgType, uint correlationId, int payloadLength)
+    {
+        int headerSize = LengthPrefixSize + FixedHeaderSize;
+        if (destination.Length < headerSize)
+        {
+            throw new ArgumentException(
+                $"Destination too small: need {headerSize} bytes, got {destination.Length}.",
+                nameof(destination));
+        }
+
+        int bodyLength = FixedHeaderSize + payloadLength;
+        BinaryPrimitives.WriteInt32LittleEndian(destination, bodyLength);
+
+        Span<byte> header = destination.Slice(LengthPrefixSize, FixedHeaderSize);
+        header[0] = (byte)msgType;
+        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(1), correlationId);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(5), payloadLength);
+
+        return headerSize;
+    }
+
+    /// <summary>
     /// Reads the outer Length field: the byte count of the fixed
     /// header + payload that follows. Throws InvalidDataException if
     /// the value is smaller than the minimum possible body
