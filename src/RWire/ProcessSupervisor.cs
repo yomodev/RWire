@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Text;
 using Microsoft.Extensions.Logging;
@@ -111,7 +110,7 @@ public enum SupervisorState
 /// See docs/phases/phase-6-process-supervision.md for the checklist
 /// this class implements against.
 /// </summary>
-public sealed class ProcessSupervisor : IDisposable
+public sealed class ProcessSupervisor : IProcessSupervisor
 {
     private static long _nextSessionId;
 
@@ -120,8 +119,7 @@ public sealed class ProcessSupervisor : IDisposable
     private readonly ILogger<ProcessSupervisor> _logger;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts = new();
-    private readonly object _recentDiagnosticsLock = new();
-    private readonly Queue<string> _recentDiagnostics = new();
+    private readonly DiagnosticsBuffer _diagnostics;
 
     private Process _process;
     private IRChannelListener _channelListener;
@@ -192,16 +190,7 @@ public sealed class ProcessSupervisor : IDisposable
     /// RWireOptions.RecentDiagnosticLineCapacity), for correlating
     /// with a fault after the fact (docs/spec.md section 11, Phase 6).
     /// </summary>
-    public IReadOnlyList<string> RecentDiagnosticOutput
-    {
-        get
-        {
-            lock (_recentDiagnosticsLock)
-            {
-                return _recentDiagnostics.ToArray();
-            }
-        }
-    }
+    public IReadOnlyList<string> RecentDiagnosticOutput => _diagnostics.Recent;
 
     /// <summary>
     /// Raised for every line the R process writes to stdout or
@@ -244,6 +233,8 @@ public sealed class ProcessSupervisor : IDisposable
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _channelListenerFactory = channelListenerFactory ?? throw new ArgumentNullException(nameof(channelListenerFactory));
         _logger = logger ?? NullLogger<ProcessSupervisor>.Instance;
+        _diagnostics = new DiagnosticsBuffer(_options.RecentDiagnosticLineCapacity);
+        _diagnostics.LineRecorded += (line, isError) => DiagnosticOutput?.Invoke(line, isError);
         (_process, _channelListener, _token) = CreateProcessAndListener();
 
         // Best-effort orphan mitigation, not a guarantee - see
@@ -330,33 +321,6 @@ public sealed class ProcessSupervisor : IDisposable
     }
 
     /// <summary>
-    /// Reads lines from reader and raises DiagnosticOutput for each,
-    /// until EOF (the process closed the stream, normally because it
-    /// exited). Also feeds RecentDiagnosticOutput's bounded history.
-    /// Runs as a background task started right after Process.Start()
-    /// so early output - including from a process that fails almost
-    /// immediately - is captured well before any caller gets around to
-    /// checking DiagnosticOutput.
-    /// </summary>
-    private async Task PumpStreamAsync(TextReader reader, bool isError)
-    {
-        string? line;
-        while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) is not null)
-        {
-            lock (_recentDiagnosticsLock)
-            {
-                _recentDiagnostics.Enqueue(line);
-                while (_recentDiagnostics.Count > _options.RecentDiagnosticLineCapacity)
-                {
-                    _recentDiagnostics.Dequeue();
-                }
-            }
-
-            DiagnosticOutput?.Invoke(line, isError);
-        }
-    }
-
-    /// <summary>
     /// Starts the R process, waits for it to connect back, validates
     /// the HELLO handshake, and starts the heartbeat loop. Throws if
     /// the process fails to launch, never connects/sends HELLO within
@@ -421,8 +385,8 @@ public sealed class ProcessSupervisor : IDisposable
             throw new InvalidOperationException("Process.Start returned false.");
         }
 
-        _stdoutPumpTask = PumpStreamAsync(_process.StandardOutput, isError: false);
-        _stderrPumpTask = PumpStreamAsync(_process.StandardError, isError: true);
+        _stdoutPumpTask = _diagnostics.PumpAsync(_process.StandardOutput, isError: false);
+        _stderrPumpTask = _diagnostics.PumpAsync(_process.StandardError, isError: true);
 
         using var timeoutCts = new CancellationTokenSource(_options.HandshakeTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
@@ -674,9 +638,9 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            _connection.Send(MsgType.Eval, correlationId, EncodeEvalPayload(expression).WrittenSpan);
+            _connection.Send(MsgType.Eval, correlationId, ProcessSupervisorWireCodec.EncodeEvalPayload(expression).WrittenSpan);
             using Frame response = _connection.Receive();
-            RValue result = DecodeResponse(response);
+            RValue result = ProcessSupervisorWireCodec.DecodeResponse(response);
             State = SupervisorState.Ready;
             return result;
         }
@@ -705,10 +669,10 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            await _connection.SendAsync(MsgType.Eval, correlationId, EncodeEvalPayload(expression).WrittenMemory, ct)
+            await _connection.SendAsync(MsgType.Eval, correlationId, ProcessSupervisorWireCodec.EncodeEvalPayload(expression).WrittenMemory, ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
-            RValue result = DecodeResponse(response);
+            RValue result = ProcessSupervisorWireCodec.DecodeResponse(response);
             State = SupervisorState.Ready;
             return result;
         }
@@ -743,9 +707,9 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            _connection.Send(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments).WrittenSpan);
+            _connection.Send(MsgType.Call, correlationId, ProcessSupervisorWireCodec.EncodeCallPayload(functionName, arguments).WrittenSpan);
             using Frame response = _connection.Receive();
-            RValue result = DecodeResponse(response);
+            RValue result = ProcessSupervisorWireCodec.DecodeResponse(response);
             State = SupervisorState.Ready;
             return result;
         }
@@ -777,10 +741,10 @@ public sealed class ProcessSupervisor : IDisposable
         {
             uint correlationId = _connection!.NextCorrelationId();
             await _connection
-                .SendAsync(MsgType.Call, correlationId, EncodeCallPayload(functionName, arguments).WrittenMemory, ct)
+                .SendAsync(MsgType.Call, correlationId, ProcessSupervisorWireCodec.EncodeCallPayload(functionName, arguments).WrittenMemory, ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
-            RValue result = DecodeResponse(response);
+            RValue result = ProcessSupervisorWireCodec.DecodeResponse(response);
             State = SupervisorState.Ready;
             return result;
         }
@@ -851,7 +815,7 @@ public sealed class ProcessSupervisor : IDisposable
             await _connection.SendAsync(MsgType.SetObj, correlationId, writer.WrittenMemory, ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
-            long id = DecodeHandleIdResult(response);
+            long id = ProcessSupervisorWireCodec.DecodeHandleIdResult(response);
             State = SupervisorState.Ready;
             return new RHandle(this, SessionId, id);
         }
@@ -884,7 +848,7 @@ public sealed class ProcessSupervisor : IDisposable
             RValueCodec.Encode(writer, value);
             _connection.Send(MsgType.SetObj, correlationId, writer.WrittenSpan);
             using Frame response = _connection.Receive();
-            long id = DecodeHandleIdResult(response);
+            long id = ProcessSupervisorWireCodec.DecodeHandleIdResult(response);
             State = SupervisorState.Ready;
             return new RHandle(this, SessionId, id);
         }
@@ -915,10 +879,10 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            await _connection.SendAsync(MsgType.GetObj, correlationId, EncodeHandleId(id), ct)
+            await _connection.SendAsync(MsgType.GetObj, correlationId, ProcessSupervisorWireCodec.EncodeHandleId(id), ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
-            RValue result = DecodeResponse(response);
+            RValue result = ProcessSupervisorWireCodec.DecodeResponse(response);
             State = SupervisorState.Ready;
             return result;
         }
@@ -949,9 +913,9 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            _connection.Send(MsgType.GetObj, correlationId, EncodeHandleId(id));
+            _connection.Send(MsgType.GetObj, correlationId, ProcessSupervisorWireCodec.EncodeHandleId(id));
             using Frame response = _connection.Receive();
-            RValue result = DecodeResponse(response);
+            RValue result = ProcessSupervisorWireCodec.DecodeResponse(response);
             State = SupervisorState.Ready;
             return result;
         }
@@ -982,10 +946,10 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            await _connection.SendAsync(MsgType.CreateRef, correlationId, EncodeHandleId(id), ct)
+            await _connection.SendAsync(MsgType.CreateRef, correlationId, ProcessSupervisorWireCodec.EncodeHandleId(id), ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
-            EnsureSuccessAck(response);
+            ProcessSupervisorWireCodec.EnsureSuccessAck(response);
             State = SupervisorState.Ready;
             return new RHandle(this, SessionId, id);
         }
@@ -1016,9 +980,9 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            _connection.Send(MsgType.CreateRef, correlationId, EncodeHandleId(id));
+            _connection.Send(MsgType.CreateRef, correlationId, ProcessSupervisorWireCodec.EncodeHandleId(id));
             using Frame response = _connection.Receive();
-            EnsureSuccessAck(response);
+            ProcessSupervisorWireCodec.EnsureSuccessAck(response);
             State = SupervisorState.Ready;
             return new RHandle(this, SessionId, id);
         }
@@ -1057,10 +1021,10 @@ public sealed class ProcessSupervisor : IDisposable
         try
         {
             uint correlationId = _connection!.NextCorrelationId();
-            await _connection.SendAsync(MsgType.ReleaseRef, correlationId, EncodeHandleId(id), ct)
+            await _connection.SendAsync(MsgType.ReleaseRef, correlationId, ProcessSupervisorWireCodec.EncodeHandleId(id), ct)
                 .ConfigureAwait(false);
             using Frame response = await _connection.ReceiveAsync(ct).ConfigureAwait(false);
-            EnsureSuccessAck(response);
+            ProcessSupervisorWireCodec.EnsureSuccessAck(response);
             if (wasReady)
             {
                 State = SupervisorState.Ready;
@@ -1109,130 +1073,6 @@ public sealed class ProcessSupervisor : IDisposable
                 // Best-effort - see summary above.
             }
         });
-    }
-
-    private static byte[] EncodeHandleId(long id)
-    {
-        byte[] buffer = new byte[8];
-        BinaryPrimitives.WriteInt64LittleEndian(buffer, id);
-        return buffer;
-    }
-
-    private static long DecodeHandleIdResult(Frame response)
-    {
-        if (response.MsgType == MsgType.Error)
-        {
-            throw DecodeError(response.Payload.Span);
-        }
-
-        if (response.MsgType != MsgType.Result || response.Payload.Length != 8)
-        {
-            throw new InvalidOperationException(
-                $"Expected an 8-byte handle id in RESULT, got {response.MsgType} " +
-                $"with {response.Payload.Length} payload bytes.");
-        }
-
-        return BinaryPrimitives.ReadInt64LittleEndian(response.Payload.Span);
-    }
-
-    private static void EnsureSuccessAck(Frame response)
-    {
-        if (response.MsgType == MsgType.Error)
-        {
-            throw DecodeError(response.Payload.Span);
-        }
-
-        if (response.MsgType != MsgType.Result)
-        {
-            throw new InvalidOperationException($"Expected RESULT or ERROR, got {response.MsgType}.");
-        }
-    }
-
-    private static ArrayBufferWriter<byte> EncodeEvalPayload(string expression)
-    {
-        var writer = new ArrayBufferWriter<byte>();
-        WireStrings.Write(writer, expression);
-        return writer;
-    }
-
-    private static ArrayBufferWriter<byte> EncodeCallPayload(string functionName, IReadOnlyList<RCallArgument> arguments)
-    {
-        var writer = new ArrayBufferWriter<byte>();
-        WireStrings.Write(writer, functionName);
-
-        Span<byte> countSpan = writer.GetSpan(4);
-        BinaryPrimitives.WriteInt32LittleEndian(countSpan, arguments.Count);
-        writer.Advance(4);
-
-        foreach (RCallArgument arg in arguments)
-        {
-            Span<byte> isHandleSpan = writer.GetSpan(1);
-            isHandleSpan[0] = (byte)(arg.IsHandle ? 1 : 0);
-            writer.Advance(1);
-
-            if (arg.IsHandle)
-            {
-                long id = arg.Handle.Id; // throws ObjectDisposedException if released
-                Span<byte> idSpan = writer.GetSpan(8);
-                BinaryPrimitives.WriteInt64LittleEndian(idSpan, id);
-                writer.Advance(8);
-            }
-            else
-            {
-                RValueCodec.Encode(writer, arg.Value);
-            }
-        }
-
-        return writer;
-    }
-
-    private static RValue DecodeResponse(Frame response)
-    {
-        if (response.MsgType == MsgType.Error)
-        {
-            throw DecodeError(response.Payload.Span);
-        }
-
-        if (response.MsgType != MsgType.Result)
-        {
-            throw new InvalidOperationException(
-                $"Expected RESULT or ERROR, got {response.MsgType}.");
-        }
-
-        return RValueCodec.Decode(response.Payload.Span);
-    }
-
-    /// <summary>
-    /// Decodes an ERROR frame's payload into an RErrorException.
-    /// Wire shape (docs/spec.md section 4.2, ERROR):
-    ///   [Message: Len(4)+UTF8] [ClassCount(4)] {Len(4)+UTF8}*ClassCount [HasCall(1)] [Call: Len(4)+UTF8]?
-    /// This is a structured object sent over the protocol itself, not
-    /// something inferred from stdout/stderr - the connection's data
-    /// channel and the diagnostic-logging channel are deliberately
-    /// separate (docs/spec.md section 2), and relying on stdout/stderr
-    /// to communicate a specific request's failure back to the caller
-    /// that made it would be fragile (ordering isn't guaranteed to
-    /// line up with which request caused it, and there is nothing
-    /// stopping arbitrary R code from writing to stdout/stderr itself).
-    /// </summary>
-    private static RErrorException DecodeError(ReadOnlySpan<byte> payload)
-    {
-        int offset = 0;
-        string message = WireStrings.Read(payload, ref offset);
-
-        int classCount = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(offset, 4));
-        offset += 4;
-        var classes = new string[classCount];
-        for (int i = 0; i < classCount; i++)
-        {
-            classes[i] = WireStrings.Read(payload, ref offset);
-        }
-
-        byte hasCall = payload[offset];
-        offset += 1;
-        string? call = hasCall == 1 ? WireStrings.Read(payload, ref offset) : null;
-
-        return new RErrorException(message, classes, call);
     }
 
     /// <summary>

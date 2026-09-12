@@ -264,7 +264,7 @@ public class ProcessSupervisorTests
         result.DoubleValues![0].Should().Be(4.0);
     }
 
-    /*[Fact]
+    [Fact]
     public async Task RestartExhaustion_AfterMaxAttempts_BecomesPermanentlyFailed()
     {
         // A channel listener factory that works once (the initial
@@ -311,7 +311,7 @@ public class ProcessSupervisorTests
 
     private sealed class AlwaysFailingChannelListener : IRChannelListener
     {
-        public int Port => 0;
+        public string ChannelArgument => "0";
 
         public Task<IRChannel> AcceptAsync(CancellationToken cancellationToken = default) =>
             throw new IOException("Simulated listener failure for restart-exhaustion testing.");
@@ -319,5 +319,5 @@ public class ProcessSupervisorTests
         public void Dispose()
         {
         }
-    }*/
+    }
 }

@@ -251,11 +251,11 @@ This keeps the codec fast and allocation-light (no boxing into
 giving calling code a comfortable nullable-typed surface if it wants
 one, via a separate conversion step applied on demand.
 
-### 5.2 Logical encoding — negotiated, not fixed
+### 5.2 Logical encoding — compact only (not negotiated)
 
 R stores `logical` internally as a 4-byte int (0 / 1 / `INT_MIN`=NA) —
-identical sentinel to `integer`. Two wire representations are
-supported:
+identical sentinel to `integer`. Two wire representations were
+originally considered:
 
 - **Wide** (4 bytes/element): zero R-side transform cost — `writeBin`
   writes the underlying bytes verbatim.
@@ -263,8 +263,15 @@ supported:
   (`ifelse(is.na(x), 2L, as.integer(x))`) before `writeBin(..., size=1)` —
   cheap (single vectorized pass), but not free.
 
-Chosen per-message based on vector size (compact only pays off for
-large logical vectors) rather than fixed at the protocol level.
+**Implemented: only the compact encoding.** The negotiated wide/compact
+pair described here originally was never built — there's no
+benchmarking data showing the wide encoding's zero-transform-cost
+property earns its added protocol complexity (a per-message choice
+both sides have to encode/decode consistently). Revisit if profiling
+(see `docs/phases/phase-8-plan.md`) shows compact's vectorized remap is
+a measurable cost at realistic vector sizes. See
+`docs/spec-deviations.md` for this and other implementation-vs-spec
+divergences collected in one place.
 
 ### 5.3 Attributes
 

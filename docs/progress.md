@@ -5,7 +5,9 @@
    actually done vs. still open.
 2. Open `docs/spec.md` for the full locked-in design (architecture,
    protocol, type mapping, table format, rationale for rejected
-   alternatives like Arrow).
+   alternatives like Arrow), and `docs/spec-deviations.md` for every
+   place implementation has diverged from it, organized by spec
+   section.
 3. Open `docs/phases/phase-N-*.md` for the current phase — each one is
    self-contained: goal, prerequisites, a concrete checklist, files to
    touch, and exit criteria, written so it doesn't require re-reading
@@ -19,8 +21,7 @@
 
 Do not re-derive design decisions already settled in `spec.md` —
 if something there seems wrong once implementation starts, record the
-change in "Decisions changed since spec" below rather than silently
-diverging.
+change in `docs/spec-deviations.md` rather than silently diverging.
 
 ---
 
@@ -33,9 +34,8 @@ from a stricter analyzer setup than this sandbox has ever had
 available, and a long list of substantive design questions and asks.
 This phase works through that list. **Not everything below is done
 yet** - see "Done this session" vs. "Still pending" below, and the
-detailed forward plan in `docs/phases/phase-8-plan.md` (not yet
-written as of this update - write it before considering this phase
-closed).
+detailed forward plan in `docs/phases/phase-8-plan.md` (now written -
+covers ordering/rationale for everything still pending).
 
 ### Done this session
 
@@ -124,27 +124,87 @@ closed).
   strings, a 10,000-element array, a 5,000-row `List<TRecord>` → TABLE
   → `List<TRecord>` round trip, and three-levels-deep nested objects.
 
+- **Wrote `docs/phases/phase-8-plan.md`**: the forward-plan doc this
+  file references, sequencing every still-pending item below into
+  tiers (small/self-contained, needs-diff-writeup-first,
+  needs-real-machine) with rationale for the ordering.
+- **`IProcessSupervisor` interface + README usage docs**: extracted an
+  interface (`IProcessSupervisor.cs`) mirroring `ProcessSupervisor`'s
+  full public call surface (status/diagnostics properties, the
+  `DiagnosticOutput` event, `StartAsync`, and all five
+  Eval/Call/SetObj/GetObj/CreateRef operations in both sync and async
+  form) so host application code can depend on the interface instead
+  of the concrete class for its own unit tests. Deliberately scoped:
+  `RHandle` still calls back into the concrete `ProcessSupervisor`
+  internally regardless of which type a caller holds it through - this
+  is a mockable call surface, not a full abstraction over internals.
+  See `phase-8-plan.md`'s "IProcessSupervisor design notes" for the
+  reasoning. README rewritten from its stale Phase-0 status line to
+  reflect actual current status, plus a full usage section (basic
+  Eval/Call/SetObj example, logging, fault/restart behavior, custom
+  channels).
+- **Wrote `docs/spec-deviations.md`**: every divergence between
+  `spec.md` and the actual implementation, consolidated in one place
+  and organized by spec section (rather than the session-by-session
+  order it accumulated in). Distinguishes divergences that are fully
+  **resolved** (spec.md itself has now been corrected to match, e.g.
+  §4.2's PING/PONG split, §5.3's narrower factor encoding) from ones
+  that are still **open** (most notably §6.2's TABLE streaming goal,
+  still unimplemented after two deferrals, and §5.2's compact-only
+  logical encoding, where spec.md was *also* out of date until this
+  pass — spec.md §5.2 corrected as part of writing this doc, since it
+  still described a negotiated wide/compact pair that was never
+  built). This document is now what "record the change... rather than
+  silently diverging" (top of this file) points to; the old inline
+  "Decisions changed since spec.md" section has been trimmed to a
+  pointer at it, so there's a single copy to keep in sync going
+  forward.
+- **`ProcessSupervisor` decomposition, partial**: extracted
+  `ProcessSupervisorWireCodec` (the seven pure static encode/decode
+  helpers) and `DiagnosticsBuffer` (the stdout/stderr ring buffer) out
+  of `ProcessSupervisor.cs` — mechanical, zero behavior change,
+  ~160 lines removed. The larger lifecycle/dispatch/supervision split
+  was investigated and deliberately **not** attempted: it would touch
+  a real synchronization subtlety (`_connectionLock` doesn't guard
+  `_connection` during a restart — `State`/`_restartGate` do that
+  instead) that's too easy to get wrong without a compiler/test runner
+  to catch it. Full analysis and recommendation in
+  `docs/phases/processsupervisor-decomposition.md`.
+- **Real TABLE streaming design**: written up in full as
+  `docs/phases/table-streaming-design.md` rather than attempted as a
+  code change. Resolves the fork Phase 7 got stuck on (`IBufferWriter`
+  flush-hook vs. `async Encode`) by observing neither is needed: a
+  streaming `IBufferWriter` can write through in small bounded chunks
+  without a flush hook, and the length-prefix problem is solved by
+  running the existing, unchanged `Encode` twice (once to count bytes,
+  once to stream them) instead of hand-maintaining a second length
+  formula. Write side (C#→R) is designed in implementable detail; read
+  side (R→C#) is flagged as needing its own follow-up pass since
+  `RValueCodec.Decode` is structurally offset-based over an
+  already-complete span, plus a concrete independent reason to
+  prioritize it later (large-table receives likely aren't actually
+  served from `ArrayPool.Shared`'s pooled buckets today — worth
+  confirming on a real runtime).
+
 ### Still pending from this feedback (see docs/phases/phase-8-plan.md)
 
-- README usage documentation + an `IProcessSupervisor` interface for
-  mockability.
-- A detailed, dedicated "what diverged from the original plan and why"
-  document (this file's "Decisions changed since spec.md" section
-  covers it piecemeal; the user asked for something more consolidated).
 - A runnable benchmark harness (BenchmarkDotNet or similar) for the
   user to execute and report results back, since this sandbox has
   never had R/.NET available to run one directly.
-- `ProcessSupervisor` responsibility decomposition (it's grown large
-  across Phases 1, 6, and this session's logging/zombie-mitigation
-  additions - the user asked directly whether it's doing too much).
+- `ProcessSupervisor` responsibility decomposition — **partially done**,
+  see "Done this session" above and
+  `docs/phases/processsupervisor-decomposition.md` for the full
+  lifecycle/dispatch/supervision split, which is deliberately not
+  attempted yet.
 - `System.IO.Pipelines`-based rewrite of `RConnection`'s read/write
   path (the user specifically asked about Pipelines/Channels for
   read/write performance, beyond the socket-option tuning done this
   session).
-- The still-outstanding real TABLE streaming work from Phase 7,
-  discussed again directly in this feedback ("the tables should be
-  streamed as we planned at the beginning") - needs the detailed
-  diff-from-plan writeup above as context, then a concrete design.
+- The real TABLE streaming work from Phase 7 — **design done**, see
+  "Done this session" above and
+  `docs/phases/table-streaming-design.md`. Implementation is not
+  started; the write side (C#→R) is designed in full, the read side
+  (R→C#) explicitly needs its own follow-up design pass.
 - Cross-platform (Linux) verification - the code is believed already
   cross-platform (no Windows-specific APIs used), but "believed" isn't
   "verified"; a Dockerfile for the user to test with under WSL/Docker
@@ -197,7 +257,7 @@ closed).
 - [x] Phase 4 — `TABLE` type & bulk transfer — **confirmed working** (streaming optimization still deferred to Phase 7 — see below)
 - [x] Phase 5 — Cold path (serialize/unserialize) + irregular objects — **confirmed working**
 - [x] Phase 6 — Process supervision & resilience — **confirmed working**
-- [ ] Phase 7 — Performance hardening (partially implemented — see phase doc; TABLE streaming and C-rewrite profiling still open)
+- [ ] Phase 7 — Performance hardening (partially implemented — see phase doc; TABLE streaming design now done, see docs/phases/table-streaming-design.md; implementation and C-rewrite profiling still open)
 - [ ] Phase 8 — Feedback-driven hardening (in progress — see "Current phase" above and docs/phases/phase-8-plan.md)
 
 Each phase's detail doc has its own finer-grained checklist. "Confirmed
@@ -206,84 +266,9 @@ it compiled during implementation.
 
 ## Decisions changed since spec.md was written
 
-- **PING/PONG split into distinct MsgType codes** (`PING = 0x02`,
-  `PONG = 0x03`, shifting every later value up by one) — the original
-  spec table's shared `0x02` was documentation shorthand, not a
-  workable wire value for two frames going opposite directions.
-  `spec.md` §4.2 corrected to match; `MsgType.cs` is the source of
-  truth for numbering.
-- **Logical vectors use only the compact (1-byte) wire encoding**, not
-  the wide/compact negotiated pair spec §5.2 describes — no
-  benchmarking data yet to justify the added complexity. Revisit in
-  Phase 7 if profiling shows it matters.
-- **Factor encoding is narrower than spec §5.3 originally described**:
-  only `class` is fast-pathed; `levels` rides the generic attribute
-  block as one recursive entry rather than a dedicated wire slot.
-  `spec.md` §5.3 corrected to describe this as the actual design.
-- **`RHandle` is a plain `IDisposable` class with a finalizer, not
-  `SafeHandle`** — `SafeHandle` is shaped around native/unmanaged
-  handles with OS-level semantics; RWire's handle is a logical 64-bit
-  ID with no OS resource behind it.
-- **Double-release is a no-op, not an error** — a client-side double
-  release (Dispose racing a finalizer, or a caller mistake) is normal
-  and harmless; erroring on it would make defensive `Dispose()`
-  patterns actively dangerous.
-- **Handle IDs are allocated as 32-bit R integers**, not the full
-  64-bit range the wire format's 8-byte slot implies — base R has no
-  native 64-bit integer without the `bit64` package, and ~2 billion
-  objects/session is far more than any realistic need. The wire slot
-  stays 8 bytes (high word always zero) so the format doesn't need to
-  change if the allocator ever does.
-- **A disposed-handle mistake is validated and thrown *before*
-  acquiring the connection lock / entering `Busy` state** — using an
-  already-disposed `RHandle` is a client programming error, not a
-  connection failure, and must not fault the supervisor.
-- **TABLE's zero-copy/streaming goal (spec.md §6.2) is not yet
-  implemented.** Both sides still buffer the whole encoded value in
-  memory before sending. The wire *format* is faithful to spec; the
-  bulk-transfer performance property that motivated designing TABLE at
-  all is Phase 7's job.
-- **`ProcessSupervisor` depends on `IRChannelListener`/
-  `Func<IRChannelListener>`, never a concrete `TcpListener`,** for
-  establishing the channel — extending Phase 1's `IRChannel`
-  abstraction to the connection-establishment side too, and (as of
-  Phase 6) supporting restart by minting a fresh listener per attempt.
-- **Async stdio pump tasks** (`PumpStreamAsync` via `ReadLineAsync`)
-  replace the `BeginOutputReadLine`/`OutputDataReceived` event
-  pattern, so `Dispose()` can deterministically await both streams
-  draining instead of guessing a delay. Also now feeds a bounded
-  recent-output ring buffer (`RecentDiagnosticOutput`) used to
-  correlate fault exception messages with what R actually printed
-  (Phase 6).
-- **`RErrorException` carries structured `Classes`/`Call` fields**, not
-  just a message — still sent as a real object over the wire protocol
-  (never inferred from stdout/stderr), just richer.
-- **Fatal-signature scanning of stdout/stderr was not implemented as
-  an independent restart trigger** (Phase 6) — spec §3.3 requires it
-  stay "a secondary signal, never the sole trigger," and a regex
-  pattern-matcher feeding a decision already made reliably by process-
-  exit/heartbeat-timeout signals wasn't worth the false-positive risk
-  of matching R's freeform error text. The recent-diagnostics ring
-  buffer achieves the actual goal (correlating output with a fault)
-  without that risk.
-- **TABLE transfer still buffers the whole encoded value on both
-  sides** even after Phase 7 (see its phase doc for the full
-  reasoning) — `RConnection.Send`/`SendAsync` no longer copy the
-  payload an extra time, which is a real fix, but `RValueCodec.Encode`
-  itself remains one-shot-into-one-writer. Making it flush per-column
-  needs either an `IBufferWriter` flush-hook (doesn't exist on the
-  interface) or an `async Encode` signature (a breaking change to
-  every existing call site) — judged too risky to attempt without a
-  compiler available to verify it, especially right after Phases 1–5
-  were confirmed working through actual manual testing. Still open;
-  not silently dropped.
-- **The "rewrite the R side in C" question remains a prose estimate,
-  not a benchmarked one** — no R/.NET installation has been available
-  anywhere in this project's sandbox to actually run the benchmark
-  scaffolding Phase 7 added (`SyncVsAsyncBenchmarkTests`,
-  `TablePerformanceTests`). Whoever next has a real machine should run
-  them before trusting either the earlier estimate or assuming it's
-  been superseded.
+Moved to `docs/spec-deviations.md`, organized by spec section instead
+of chronologically, and marked resolved/open per item. Do not add new
+entries here — add them there.
 
 ## Notes / blockers
 
