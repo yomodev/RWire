@@ -193,6 +193,145 @@ covers ordering/rationale for everything still pending).
   `dotnet build`/`dotnet test` against the whole solution so the
   Rscript-launching integration tests actually execute on Linux.
 
+### First real test run — fixes from actual failures
+
+The user ran `dotnet test` twice now. Round 1 (six failures): five
+were genuine bugs, now fixed; the other two (both timing-sensitive
+process/heartbeat tests) are very likely the long-tracked "flaky test"
+finally caught with an actual explanation, addressed via test-suite
+configuration rather than a production-code change - see below for why.
+
+
+  with `TypeTag.Null` (e.g. a null `string`/`DateTime`/`TimeOnly`/
+  `Guid` property) crashed with a `NullReferenceException` on decode
+  whenever the target type had a *registered direct edge* (string,
+  DateTime, Guid, etc.) - `ConvertObject` checks the direct-edge table
+  before ever reaching the structural/Null-aware path
+  (`TryStructuralConvert`/`ConvertFromRValue`), so the direct edge's
+  own body (e.g. `v.CharacterValues![0]!`) ran against an
+  `RValue.Null()`, which has no data in any of its arrays. Fixed by
+  adding the Null check directly in `ConvertObject`, before the
+  direct-edge lookup - the single place every conversion path actually
+  goes through. Removed the now-unreachable duplicate check that
+  previously lived in `ConvertFromRValue` (dead code once the earlier
+  check exists) rather than leave two copies of the same logic to
+  drift out of sync. This was `KitchenSinkDto_FullyPopulated_RoundTrips`'s
+  `NullReferenceException` - `NullableStringValue = null` (plus three
+  other null nullable properties of directly-edged types) triggered it.
+- **Real bug, decimal conversion**: `(decimal)v.DoubleValues![0]`
+  threw `OverflowException` for `decimal.MaxValue` - decimal has ~28-29
+  significant digits, double only ~15-17, so `decimal.MaxValue` rounds
+  to a double that lands at or just past decimal's actual representable
+  range even though it's nowhere near double's own (much larger)
+  magnitude ceiling. Fixed by clamping to `decimal.MaxValue`/
+  `MinValue` when the double is at or beyond that boundary, consistent
+  with how `long`/`ulong`/`uint` already document "rides the Double
+  vector, loses precision beyond double's range" as expected behavior
+  rather than a crash.
+- **Real bug, DateTime conversion**: `unixEpoch.AddSeconds(seconds)`
+  threw `ArgumentOutOfRangeException` for `DateTime.MaxValue` -
+  floating-point rounding in the seconds-since-epoch double was enough
+  to push the reconstructed value just past `DateTime.MaxValue`'s tick
+  range, even though the original value was in range. Fixed by
+  catching that specific exception and clamping to `DateTime.MinValue`/
+  `MaxValue` (sign of the seconds value determines which) - the
+  clamped result differs from the true value by less than the
+  rounding error that caused the overflow in the first place, well
+  inside the test's own 1ms tolerance.
+- **Test bugs, not production bugs** (both in `RTypeConverterStressTests`):
+  - `Long_ExtremeValues...`: the test manually reproduced an
+    *unchecked* `(long)` cast on a double and asserted the result
+    differs from `long.MaxValue` - but .NET's unchecked
+    floating-point-to-integer conversions saturate (a real runtime
+    behavior, not a bug), and for this exact boundary the saturated
+    result coincidentally equals `long.MaxValue`, making the assertion
+    fail for a reason unrelated to any real defect. Rewritten to
+    assert what's actually true and meaningful: the *registered*
+    converter uses a `checked` cast and correctly throws
+    `OverflowException` for `long.MaxValue`.
+  - `Decimal_ExtremeValues...`: previously asserted
+    `decimal.MaxValue`'s round trip differs from the original - once
+    the production clamp fix above lands, that value round-trips
+    *exactly* (the clamp recovers it), so the assertion needed
+    updating rather than the code. Rewritten to assert the clamp
+    behavior directly (no throw, exact match at the boundary) plus a
+    genuinely lossy case using a large decimal with real fractional
+    precision beyond double's ~15-17 significant digits, which
+    demonstrates actual precision loss without relying on
+    boundary-clamp coincidence.
+- **Likely resolved, the long-tracked "flaky test"**: two failures -
+  `ConcurrencyAndCancellationTests.Cancellation_BeforeAcquiringConnectionLock_DoesNotTriggerRestart`
+  and `ProcessSupervisorTests.ExternalProcessKill_TriggersAutomaticRestart_AndSupervisorRecovers`
+  - both showed a supervisor state inconsistent with either test's
+  timing assumptions (an unexpected `Restarting`; a kill never observed
+  across a full 5-second poll window). Both tests use deliberately
+  tight timing budgets (`HeartbeatInterval=300ms`,
+  `HeartbeatResponseTimeout=2s`, restart backoff in the low hundreds of
+  ms) to keep the suite fast, and **neither test class is in a shared
+  xunit collection** - every test class in this project is its own
+  implicit collection, and xunit parallelizes collections against each
+  other by default. That means this suite, as configured, runs a
+  dozen-plus classes' worth of real `Rscript` subprocesses, socket
+  I/O, and heartbeat loops all at once - real, not simulated, system
+  contention exactly capable of blowing through timing budgets sized
+  for a quiet machine. This fits both failures precisely (a heartbeat
+  round-trip or a `Process.Exited` callback delayed by scheduling
+  contention, not a logic bug in `Fault()`/`OnProcessExited`, which
+  were checked directly and look correct - `Process.Exited` is already
+  wired for near-instant crash detection, independent of the
+  heartbeat). Rather than loosen the tests' timing budgets (which
+  would just mask the same underlying contention without fixing it, and
+  make the suite slower for everyone) or touch verified restart/
+  heartbeat logic on unreproduced evidence, added
+  `tests/RWire.Tests/AssemblyInfo.cs` with
+  `[assembly: CollectionBehavior(DisableTestParallelization = true)]` -
+  forces the whole suite to run one collection at a time, eliminating
+  cross-class contention as a variable. **Not yet verified** (needs a
+  real test run to confirm both failures don't recur) - if either
+  still flakes with this in place, that's much stronger evidence of an
+  actual production bug worth investigating with real timestamped
+  NLog output, rather than environmental contention.
+
+### Second real test run — two more fixes
+
+After the round-1 fixes above, a second `dotnet test` run surfaced two
+more failures. Same pattern: one genuine platform-level exception bug,
+one wrong test assumption.
+
+- **Real bug, `LaunchAsync`'s handshake timeout**: cancelling
+  `_channelListener.AcceptAsync(linkedCts.Token)` via `timeoutCts`
+  firing can surface as a raw `SocketException`
+  (`SocketError.OperationAborted`, "I/O operation has been aborted
+  because of either a thread exit or an application request") instead
+  of a clean `OperationCanceledException` - a real, observed .NET/
+  Windows platform quirk in how a cancellation-triggered abort of a
+  pending `TcpListener.AcceptTcpClientAsync` completes, not something
+  application code can prevent. The existing `catch
+  (OperationCanceledException) when (timeoutCts.IsCancellationRequested)`
+  only handled the well-behaved case, so the raw `SocketException`
+  escaped uncaught instead of becoming the documented `TimeoutException`.
+  Fixed by adding a parallel `catch (SocketException) when
+  (timeoutCts.IsCancellationRequested)` right next to it - same
+  handling, since `timeoutCts` firing makes the cause unambiguous
+  either way. Applied to both `AcceptAsync`'s catch and
+  `ReceiveAndValidateHelloAsync`'s catch (the HELLO-frame read), since
+  the latter goes through `NetworkStream.ReadAsync` and could in
+  principle hit the same class of quirk, even though this specific
+  failure was only observed on the accept side. This was
+  `DiagnosticOutput_CapturesOutput_FromWorkerScript`'s failure.
+- **Test bug, not a production bug**: `Cancellation_BeforeAcquiringConnectionLock_DoesNotTriggerRestart`
+  asserted the blocking call's result (`Sys.sleep(1)`) had
+  `TypeTag.Double` - but `Sys.sleep()` in R always returns
+  `invisible(NULL)`; that was never going to be a `Double`, regardless
+  of anything RWire does. Fixed by changing the blocking expression to
+  `"{ Sys.sleep(1); 42 }"` (still sleeps for a full second, holding
+  the lock exactly as the test needs, but now returns something
+  concrete) and asserting the actual value, not just a type that could
+  never have matched. Worth noting: this test's OTHER assertion (the
+  `State`/`RestartCount` checks that were failing in round 1) passed
+  cleanly this time - some evidence, though not proof, that the
+  `DisableTestParallelization` fix from round 1 is helping.
+
 ### Still pending from this feedback (see docs/phases/phase-8-plan.md)
 
 - A runnable benchmark harness (BenchmarkDotNet or similar) for the
@@ -219,10 +358,10 @@ covers ordering/rationale for everything still pending).
   IDE0300/IDE0301/CA1861-style suggestions beyond the specific lines
   fixed this session (these are cosmetic, not correctness issues -
   low priority relative to everything else above).
-- The specific flaky test was never identified (the user described
-  "one is flaky and some slow" without naming which) - worth following
-  up on directly once more test runs are available, ideally with the
-  new NLog output to help pinpoint it.
+- The specific flaky test(s) - see "First real test run" above for the
+  two prime suspects and the mitigation applied
+  (`DisableTestParallelization`). Needs one more real test run to
+  confirm it actually resolves them before this can be marked closed.
 
 ## Locked-in decisions (see spec.md for full detail/rationale)
 

@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -403,6 +404,21 @@ public sealed class ProcessSupervisor : IProcessSupervisor
                 $"Timed out after {_options.HandshakeTimeout} waiting for the R worker to connect back. " +
                 $"Recent output:\n{string.Join('\n', RecentDiagnosticOutput)}");
         }
+        catch (SocketException) when (timeoutCts.IsCancellationRequested)
+        {
+            // Cancelling a pending TcpListener.AcceptTcpClientAsync can
+            // surface as a raw SocketException (WSA_OPERATION_ABORTED /
+            // SocketError.OperationAborted) instead of a clean
+            // OperationCanceledException - a real, observed .NET/
+            // Windows platform quirk in how the cancellation-triggered
+            // abort completes the pending accept, not something this
+            // code can prevent. Since timeoutCts is what fired, the
+            // cause is unambiguous either way; treat it identically to
+            // the OperationCanceledException case above.
+            throw new TimeoutException(
+                $"Timed out after {_options.HandshakeTimeout} waiting for the R worker to connect back. " +
+                $"Recent output:\n{string.Join('\n', RecentDiagnosticOutput)}");
+        }
 
         _connection = new RConnection(channel);
 
@@ -412,6 +428,15 @@ public sealed class ProcessSupervisor : IProcessSupervisor
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
+            throw new TimeoutException(
+                $"Timed out after {_options.HandshakeTimeout} waiting for the HELLO frame.");
+        }
+        catch (SocketException) when (timeoutCts.IsCancellationRequested)
+        {
+            // Same platform quirk as the AcceptAsync catch above - a
+            // cancellation-triggered abort of pending socket I/O can
+            // surface as SocketException rather than
+            // OperationCanceledException. Same handling.
             throw new TimeoutException(
                 $"Timed out after {_options.HandshakeTimeout} waiting for the HELLO frame.");
         }

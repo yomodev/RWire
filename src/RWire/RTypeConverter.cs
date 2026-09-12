@@ -79,6 +79,34 @@ public sealed class RTypeConverter
             return null;
         }
 
+        // An R NULL (RValue.Null(), TypeTag.Null) carries no data in
+        // any of its type-specific arrays - LogicalCodes/IntegerValues/
+        // etc. are all left unset. This has to be handled here, before
+        // the direct-edge lookup below: a registered (RValue, T) edge
+        // (e.g. the RValue->string edge's `v.CharacterValues![0]!`)
+        // indexes straight into that array with no Null check of its
+        // own, so an RValue.Null() reaching it throws a
+        // NullReferenceException instead of converting to a real
+        // null/default. (ConvertFromRValue has its own Null check too,
+        // but that's only reached via TryStructuralConvert, which never
+        // runs for a toType with a registered direct edge - exactly
+        // the case this misses without the check here.)
+        if (value is RValue { TypeTag: RTypeTag.Null })
+        {
+            if (toType == typeof(RValue))
+            {
+                return value;
+            }
+
+            if (toType.IsValueType && Nullable.GetUnderlyingType(toType) is null)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot convert an R NULL value to non-nullable value type {toType}.");
+            }
+
+            return null;
+        }
+
         if (toType.IsInstanceOfType(value))
         {
             return value;
@@ -382,10 +410,11 @@ public sealed class RTypeConverter
 
     private object? ConvertFromRValue(RValue rv, Type toType)
     {
-        if (rv.TypeTag == RTypeTag.Null)
-        {
-            return toType.IsValueType ? Activator.CreateInstance(toType) : null;
-        }
+        // rv.TypeTag == RTypeTag.Null is already handled earlier, in
+        // ConvertObject itself - every call path reaches ConvertObject
+        // first, so that's the single place this is checked. Don't
+        // re-add a check here; see ConvertObject's comment for why it
+        // has to live there rather than here.
 
         if (toType.IsEnum)
         {
@@ -710,7 +739,38 @@ public sealed class RTypeConverter
         converter.Register<float, RValue>(v => RValue.OfDouble(new[] { (double)v }));
         converter.Register<RValue, float>(v => (float)v.DoubleValues![0]);
         converter.Register<decimal, RValue>(v => RValue.OfDouble(new[] { (double)v }));
-        converter.Register<RValue, decimal>(v => (decimal)v.DoubleValues![0]);
+        converter.Register<RValue, decimal>(v =>
+        {
+            // decimal has ~28-29 significant digits, double only ~15-17
+            // - decimal.MaxValue/MinValue round to a double that lands
+            // at or just beyond decimal's representable range (double
+            // can't hold enough digits to stay strictly inside it), so
+            // a plain (decimal) cast can throw OverflowException right
+            // at the boundary even though decimal.MaxValue itself is
+            // nowhere near double's own (much larger) magnitude limit.
+            // Clamping here means values beyond double's usable
+            // precision saturate instead of throwing - consistent with
+            // every other "rides the Double vector, loses precision
+            // beyond double's range" conversion in this file (long,
+            // ulong, uint already document the same trade-off).
+            double d = v.DoubleValues![0];
+            if (double.IsNaN(d))
+            {
+                return 0m;
+            }
+
+            if (d >= (double)decimal.MaxValue)
+            {
+                return decimal.MaxValue;
+            }
+
+            if (d <= (double)decimal.MinValue)
+            {
+                return decimal.MinValue;
+            }
+
+            return (decimal)d;
+        });
 
         // Dates/times - mapped onto R's actual native representations
         // (a Date is a double day-count with class "Date"; POSIXct is
@@ -724,7 +784,28 @@ public sealed class RTypeConverter
             DoubleValues = new[] { (dt.ToUniversalTime() - unixEpoch).TotalSeconds },
             Class = new[] { "POSIXct", "POSIXt" },
         });
-        converter.Register<RValue, DateTime>(v => unixEpoch.AddSeconds(v.DoubleValues![0]));
+        converter.Register<RValue, DateTime>(v =>
+        {
+            // AddSeconds can throw ArgumentOutOfRangeException for a
+            // value near DateTime.MinValue/MaxValue: the round-tripped
+            // seconds-since-epoch double carries enough rounding error
+            // at that magnitude to land just outside DateTime's
+            // representable tick range, even though the original
+            // DateTime itself was in range. Clamp rather than let a
+            // rounding artifact throw - the clamped result is still
+            // within the same sub-millisecond neighborhood as the
+            // true value, since the overflow is only ever by a tiny
+            // margin at the extreme ends.
+            double seconds = v.DoubleValues![0];
+            try
+            {
+                return unixEpoch.AddSeconds(seconds);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return seconds > 0 ? DateTime.MaxValue : DateTime.MinValue;
+            }
+        });
 
         DateOnly epochDate = DateOnly.FromDateTime(unixEpoch);
         converter.Register<DateOnly, RValue>(d => new RValue

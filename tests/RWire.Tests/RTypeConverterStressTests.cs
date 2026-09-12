@@ -208,28 +208,55 @@ public class RTypeConverterStressTests
         // Documented, deliberate limitation (docs/progress.md): long
         // rides RWire's Double vector since R has no native 64-bit
         // integer type. Values within double's exact-integer range
-        // (+/- 2^53) round-trip exactly; long.MinValue/MaxValue do
-        // NOT, because they exceed that range. This test asserts both
-        // halves of that reality rather than only the happy path.
+        // (+/- 2^53) round-trip exactly. long.MaxValue exceeds that
+        // range; the registered RValue->long converter uses a checked
+        // cast, so it throws OverflowException rather than silently
+        // returning a wrong value.
+        //
+        // (Not tested here via a raw unchecked (long)(double) cast:
+        // .NET's unchecked floating-point-to-integer conversions
+        // saturate at the target type's MinValue/MaxValue rather than
+        // producing an arbitrary value, and for this specific boundary
+        // that saturation coincidentally lands exactly back on
+        // long.MaxValue - which would make an "the round-tripped value
+        // differs from the original" assertion fail for a reason
+        // that has nothing to do with a real bug. Asserting the actual
+        // registered (checked) conversion's throw behavior is the
+        // meaningful, non-coincidental check.)
         long safeValue = (1L << 53) - 1; // largest exactly-representable integer in a double
         safeValue.ToRValue().To<long>().Should().Be(safeValue);
 
-        double asDouble = long.MaxValue.ToRValue().DoubleValues![0];
-        ((long)asDouble).Should().NotBe(long.MaxValue, "long.MaxValue exceeds double's exact-integer range - this is expected precision loss, not a bug");
+        Action convertMaxValue = () => long.MaxValue.ToRValue().To<long>();
+        convertMaxValue.Should().Throw<OverflowException>(
+            "long.MaxValue exceeds double's exact-integer range, and the converter uses a checked cast");
     }
 
     [Fact]
     public void Decimal_ExtremeValues_LosePrecisionBeyondDoubleRange()
     {
         // Same documented limitation as long - decimal rides Double
-        // too, so decimal's extra precision beyond what a double can
-        // represent is not preserved. A value within double's
-        // precision round-trips fine; decimal.MaxValue does not.
+        // too, so precision beyond what a double can carry is not
+        // preserved. A value within double's precision round-trips
+        // fine.
         decimal safeValue = 12345.6789m;
         safeValue.ToRValue().To<decimal>().Should().Be(safeValue);
 
-        decimal roundTrippedMax = decimal.MaxValue.ToRValue().To<decimal>();
-        roundTrippedMax.Should().NotBe(decimal.MaxValue, "decimal.MaxValue exceeds double's precision - expected, not a bug");
+        // decimal.MaxValue rounds to a double at (or just past)
+        // decimal's representable range - the converter clamps at
+        // that boundary instead of throwing OverflowException, so
+        // this specific value happens to come back exactly rather
+        // than demonstrating loss directly.
+        Action convertMaxValue = () => decimal.MaxValue.ToRValue().To<decimal>();
+        convertMaxValue.Should().NotThrow("the converter clamps at the double/decimal boundary instead of throwing");
+        decimal.MaxValue.ToRValue().To<decimal>().Should().Be(decimal.MaxValue);
+
+        // A value with meaningful fractional precision at a magnitude
+        // well beyond double's ~15-17 significant digits demonstrates
+        // the actual lossy round-trip directly, without relying on
+        // the boundary-clamp behavior above.
+        decimal largeFractional = 123456789012345.6789m; // 19 significant digits
+        decimal roundTripped = largeFractional.ToRValue().To<decimal>();
+        roundTripped.Should().NotBe(largeFractional, "double's ~15-17 significant digits can't carry this many digits of precision");
     }
 
     [Fact]

@@ -51,10 +51,15 @@ With that, the remaining pending items group into three tiers:
   described a negotiated wide/compact logical encoding that was never
   built, inconsistent with §4.2/§5.3 which had already been corrected
   to match implementation. Corrected as part of this pass.)
-- **Track down the specific flaky test.** Blocked on having NLog
-  output from actual test runs (added this session) — can't be done
-  from this sandbox. Whoever runs the Phase 7 verification pass should
-  watch for it and report back which test and what the log shows.
+- **Track down the specific flaky test.** Very likely identified and
+  addressed — see `docs/progress.md`'s "First real test run" section:
+  two specific tests, both timing-sensitive real-process/heartbeat
+  tests, most likely victims of cross-test-class resource contention
+  (every test class is its own xunit collection and collections
+  parallelize by default). Mitigated via
+  `[assembly: CollectionBehavior(DisableTestParallelization = true)]`
+  in `tests/RWire.Tests/AssemblyInfo.cs`. **Not yet verified** — needs
+  one more real test run to confirm.
 - **Project-wide `dotnet format` cleanup pass.** Cosmetic, low-risk,
   mechanical. Do it any time there's a spare cycle with a compiler
   available — no reason to sequence it precisely, just don't let it

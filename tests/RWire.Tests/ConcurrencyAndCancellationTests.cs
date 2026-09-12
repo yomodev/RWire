@@ -174,7 +174,7 @@ public class ConcurrencyAndCancellationTests
         // Hold the connection busy with a slow call, so a second call
         // is genuinely stuck waiting for the lock (not for wire I/O)
         // when we cancel it.
-        Task<RValue> blockingCall = supervisor.EvalAsync("Sys.sleep(1)", TestContext.Current.CancellationToken);
+        Task<RValue> blockingCall = supervisor.EvalAsync("{ Sys.sleep(1); 42 }", TestContext.Current.CancellationToken);
 
         using var waitingCallCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
         Func<Task> waitingAct = () => supervisor.EvalAsync("2 + 2", waitingCallCts.Token);
@@ -187,7 +187,12 @@ public class ConcurrencyAndCancellationTests
         supervisor.RestartCount.Should().Be(0);
 
         RValue blockingResult = await blockingCall;
+        // Sys.sleep() itself always returns invisible(NULL) - the
+        // expression was changed to return 42 afterward specifically
+        // so this checks the call actually completed with a real
+        // result, not just that it didn't throw.
         blockingResult.TypeTag.Should().Be(RTypeTag.Double);
+        blockingResult.DoubleValues![0].Should().Be(42);
 
         supervisor.State.Should().Be(SupervisorState.Ready);
         supervisor.RestartCount.Should().Be(0, "no fault should ever have been triggered in this scenario");
