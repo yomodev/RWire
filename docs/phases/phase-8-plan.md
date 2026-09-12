@@ -120,9 +120,16 @@ With that, the remaining pending items group into three tiers:
   run. Needs to happen before trusting any performance claim in this
   project, including the "should we rewrite the R side in C" question,
   which remains a prose estimate.
-- **Cross-platform (Linux) verification.** Write the Dockerfile/WSL
-  setup whenever convenient (no blocking dependency), but the actual
-  verification run needs a machine.
+- **Cross-platform (Linux) verification.** `Dockerfile` written (repo
+  root) — untested (this sandbox has no Docker/network access), but a
+  well-informed first draft: .NET 10 SDK base image, `r-base-core` +
+  CRAN `data.table` install, then `dotnet build`/`dotnet test` against
+  the whole solution, so the Rscript-launching integration tests run
+  for real on Linux, not just a source-level "no Windows-only API"
+  grep check. The actual verification run still needs a machine with
+  Docker. If it fails, the Dockerfile's own comments flag the most
+  likely spots (R version resolution, the CRAN install step needing
+  network at build time).
 - **OS-level zombie-process mitigation** (Windows Job Objects /
   `prctl(PR_SET_PDEATHSIG)`). Needs P/Invoke code that can't be
   meaningfully written-and-trusted without a compiler to check it

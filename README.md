@@ -45,6 +45,18 @@ require `Rscript` to be resolvable on PATH.
 dotnet test
 ```
 
+### Cross-platform (Linux) verification
+
+A `Dockerfile` at the repo root builds and tests RWire on Linux
+(`.NET 10 SDK` base image + `r-base-core` + CRAN `data.table`). It has
+not been built or run anywhere yet — see `docs/phases/phase-8-plan.md`
+for status. To try it:
+
+```
+docker build -t rwire-verify .
+docker run --rm rwire-verify
+```
+
 ## Usage
 
 The main entry point is `ProcessSupervisor`. It owns the R worker

@@ -185,6 +185,13 @@ covers ordering/rationale for everything still pending).
   prioritize it later (large-table receives likely aren't actually
   served from `ArrayPool.Shared`'s pooled buckets today — worth
   confirming on a real runtime).
+- **Dockerfile for cross-platform (Linux) verification**, at repo
+  root, plus a matching `.dockerignore`. Untested (no Docker/network
+  access in this sandbox) — a well-informed first draft, not a
+  confirmed-working image. Builds on `mcr.microsoft.com/dotnet/sdk:10.0`,
+  installs `r-base-core` + CRAN `data.table`, then runs
+  `dotnet build`/`dotnet test` against the whole solution so the
+  Rscript-launching integration tests actually execute on Linux.
 
 ### Still pending from this feedback (see docs/phases/phase-8-plan.md)
 
@@ -205,10 +212,9 @@ covers ordering/rationale for everything still pending).
   `docs/phases/table-streaming-design.md`. Implementation is not
   started; the write side (C#→R) is designed in full, the read side
   (R→C#) explicitly needs its own follow-up design pass.
-- Cross-platform (Linux) verification - the code is believed already
-  cross-platform (no Windows-specific APIs used), but "believed" isn't
-  "verified"; a Dockerfile for the user to test with under WSL/Docker
-  is planned but not yet written.
+- Cross-platform (Linux) verification — `Dockerfile` now written (see
+  "Done this session" above), but not yet built/run anywhere; the
+  actual verification still needs a machine with Docker.
 - A project-wide `dotnet format`-style cleanup pass for the remaining
   IDE0300/IDE0301/CA1861-style suggestions beyond the specific lines
   fixed this session (these are cosmetic, not correctness issues -
