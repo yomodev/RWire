@@ -23,6 +23,14 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="AwesomeAssertions" Version="9.6.0" />
+    <!-- NLog, injected as the ILogger backend for tests via
+         TestLogging.cs - RWire.csproj itself only depends on
+         Microsoft.Extensions.Logging.Abstractions and never chooses a
+         backend; NLog here demonstrates wiring a real one in and gives
+         actual log output during test runs, which is useful for
+         diagnosing the flaky/slow restart tests specifically. -->
+    <PackageReference Include="NLog" Version="5.3.4" />
+    <PackageReference Include="NLog.Extensions.Logging" Version="5.3.15" />
   </ItemGroup>
 
   <ItemGroup>

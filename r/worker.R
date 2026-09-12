@@ -5,7 +5,7 @@
 # of Phase 1's frame protocol and heartbeat/shutdown handling.
 #
 # Usage:
-#   Rscript worker.R --channel=socket --port=<port> --token=<token>
+#   Rscript worker.R --channel=socket --endpoint=<port> --token=<token>
 #
 # Frame wire format (docs/spec.md section 4.1, little-endian):
 #   [Length(4)][MsgType(1)][CorrelationId(4)][PayloadLen(4)][Payload(N)]
@@ -769,7 +769,13 @@ dispatch_frame <- function(con, frame) {
 
 main <- function(args) {
   channel <- parse_arg(args, "channel")
-  port <- as.integer(parse_arg(args, "port"))
+  # "endpoint" rather than "port": the argument is channel-agnostic
+  # (docs/spec.md section 2.1 / the IRChannelListener abstraction on
+  # the C# side) - for the socket channel it happens to be a TCP port
+  # number, but a future channel type (a named pipe, say) would pass
+  # something else here without needing a different argument name.
+  endpoint <- parse_arg(args, "endpoint")
+  port <- as.integer(endpoint)
   token <- parse_arg(args, "token")
 
   if (channel != "socket") {

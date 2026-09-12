@@ -21,7 +21,9 @@ public sealed class RWireProcessFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
-        Supervisor = new ProcessSupervisor(new RWireOptions { WorkerScriptPath = WorkerScriptPath });
+        Supervisor = new ProcessSupervisor(
+            new RWireOptions { WorkerScriptPath = WorkerScriptPath },
+            TestLogging.CreateProcessSupervisorLogger());
         await Supervisor.StartAsync(TestContext.Current.CancellationToken);
     }
 

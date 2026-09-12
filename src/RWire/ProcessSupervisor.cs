@@ -2,6 +2,8 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace RWire;
 
@@ -115,6 +117,7 @@ public sealed class ProcessSupervisor : IDisposable
 
     private readonly RWireOptions _options;
     private readonly Func<IRChannelListener> _channelListenerFactory;
+    private readonly ILogger<ProcessSupervisor> _logger;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly object _recentDiagnosticsLock = new();
@@ -130,6 +133,7 @@ public sealed class ProcessSupervisor : IDisposable
     private Task? _stderrPumpTask;
     private int _restartGate; // Interlocked guard: 0 = idle, 1 = a restart loop is running
     private bool _disposed;
+    private readonly EventHandler _processExitHandler;
 
     public SupervisorState State { get; private set; } = SupervisorState.NotStarted;
 
@@ -142,8 +146,23 @@ public sealed class ProcessSupervisor : IDisposable
     /// </summary>
     public ulong SessionId { get; private set; }
 
-    /// <summary>The ephemeral loopback port (or other listener-defined value) the current R process was told to connect back to. Changes across restarts.</summary>
-    public int Port { get; private set; }
+    /// <summary>
+    /// The ephemeral loopback port the current R process was told to
+    /// connect back to, when the active listener is TCP-based. -1 for
+    /// a non-TCP channel (e.g. a future named-pipe listener), where
+    /// there is no port at all - use ChannelArgument for anything
+    /// channel-agnostic. Changes across restarts.
+    /// </summary>
+    public int Port => int.TryParse(_channelListener.ChannelArgument, out int port) ? port : -1;
+
+    /// <summary>
+    /// Whatever value was passed to the R worker's --endpoint=
+    /// argument to connect back to the current listener - a port
+    /// number as a string for the default TCP listener, or something
+    /// else (a pipe name, "host:port", ...) for a different
+    /// IRChannelListener implementation. Changes across restarts.
+    /// </summary>
+    public string ChannelArgument => _channelListener.ChannelArgument;
 
     /// <summary>The R version string reported in the HELLO frame, populated after StartAsync (or a restart) completes.</summary>
     public string? RVersion { get; private set; }
@@ -198,7 +217,8 @@ public sealed class ProcessSupervisor : IDisposable
     internal Process ProcessForTesting => _process;
 
     /// <summary>Uses the default TCP loopback channel listener.</summary>
-    public ProcessSupervisor(RWireOptions options) : this(options, static () => new TcpRChannelListener())
+    public ProcessSupervisor(RWireOptions options, ILogger<ProcessSupervisor>? logger = null)
+        : this(options, static () => new TcpRChannelListener(), logger)
     {
     }
 
@@ -211,13 +231,26 @@ public sealed class ProcessSupervisor : IDisposable
     /// future non-socket channel. ProcessSupervisor never constructs a
     /// TcpListener/TcpClient itself; it only depends on
     /// IRChannelListener.
+    ///
+    /// logger is optional - RWire never forces a logging backend on
+    /// the host application. Pass an ILogger&lt;ProcessSupervisor&gt;
+    /// from whatever ILoggerFactory your app already uses (Serilog,
+    /// NLog via Microsoft.Extensions.Logging.NLog, the built-in
+    /// console/file providers, ...); if omitted, logging is a no-op.
     /// </summary>
-    public ProcessSupervisor(RWireOptions options, Func<IRChannelListener> channelListenerFactory)
+    public ProcessSupervisor(
+        RWireOptions options, Func<IRChannelListener> channelListenerFactory, ILogger<ProcessSupervisor>? logger = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _channelListenerFactory = channelListenerFactory ?? throw new ArgumentNullException(nameof(channelListenerFactory));
+        _logger = logger ?? NullLogger<ProcessSupervisor>.Instance;
         (_process, _channelListener, _token) = CreateProcessAndListener();
-        Port = _channelListener.Port;
+
+        // Best-effort orphan mitigation, not a guarantee - see
+        // KillCurrentProcessBestEffort's doc comment for exactly what
+        // this does and doesn't cover. Unsubscribed in Dispose().
+        _processExitHandler = (_, _) => KillCurrentProcessBestEffort();
+        AppDomain.CurrentDomain.ProcessExit += _processExitHandler;
     }
 
     private (Process Process, IRChannelListener Listener, string Token) CreateProcessAndListener()
@@ -235,7 +268,7 @@ public sealed class ProcessSupervisor : IDisposable
         };
         startInfo.ArgumentList.Add(_options.WorkerScriptPath);
         startInfo.ArgumentList.Add("--channel=socket");
-        startInfo.ArgumentList.Add($"--port={listener.Port}");
+        startInfo.ArgumentList.Add($"--endpoint={listener.ChannelArgument}");
         startInfo.ArgumentList.Add($"--token={token}");
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
@@ -248,9 +281,51 @@ public sealed class ProcessSupervisor : IDisposable
     {
         if (State is SupervisorState.Starting or SupervisorState.Ready or SupervisorState.Busy)
         {
+            _logger.LogWarning("R worker process exited unexpectedly while in state {State}", State);
             Fault(new InvalidOperationException(
                 "The R worker process exited unexpectedly. Recent output:\n" +
                 string.Join('\n', RecentDiagnosticOutput)));
+        }
+    }
+
+    /// <summary>
+    /// Registered against AppDomain.CurrentDomain.ProcessExit to
+    /// reduce - not eliminate - the chance of an orphaned R process if
+    /// the host application exits without ever calling Dispose().
+    ///
+    /// IMPORTANT - what this does and does not cover: ProcessExit
+    /// fires for an ordinary managed exit (Main() returning normally,
+    /// Environment.Exit(), an unhandled exception unwinding to the
+    /// runtime's default handler, Ctrl+C via
+    /// AppDomain/Console.CancelJoinableTasks-style shutdown on most
+    /// platforms). It does NOT fire for a hard kill of the host
+    /// process (kill -9 / SIGKILL, Task Manager "End Process" on
+    /// Windows, a container being forcibly stopped, or a power loss) -
+    /// those bypass all managed shutdown code on any platform, and
+    /// nothing running inside the process being killed can react to
+    /// them, full stop. A hard-killed host will still orphan its R
+    /// child process with this mitigation in place.
+    ///
+    /// Properly closing that gap requires an OS-level mechanism
+    /// external to this process - Windows Job Objects with
+    /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, or Linux's
+    /// prctl(PR_SET_PDEATHSIG) - both of which need P/Invoke and are
+    /// deliberately out of scope here; see
+    /// docs/phases/phase-8-plan.md for that as a concrete follow-up.
+    /// </summary>
+    private void KillCurrentProcessBestEffort()
+    {
+        try
+        {
+            if (!_disposed && !_process.HasExited)
+            {
+                _process.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+            // Best-effort - see this method's summary above for what
+            // it can't cover; failing here just means the same gap.
         }
     }
 
@@ -301,13 +376,20 @@ public sealed class ProcessSupervisor : IDisposable
         }
 
         State = SupervisorState.Starting;
+        _logger.LogInformation(
+            "Starting R worker via '{RScriptPath} {WorkerScriptPath}' on endpoint {ChannelArgument}",
+            _options.RScriptPath, _options.WorkerScriptPath, _channelListener.ChannelArgument);
 
         try
         {
             await LaunchAsync(cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation(
+                "R worker started successfully (R version: {RVersion}, session {SessionId})",
+                RVersion, SessionId);
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogError(ex, "Failed to start the R worker");
             State = SupervisorState.Faulted;
             throw;
         }
@@ -432,6 +514,7 @@ public sealed class ProcessSupervisor : IDisposable
             return;
         }
 
+        _logger.LogWarning(cause, "Supervisor faulted - starting automatic restart");
         State = SupervisorState.Restarting;
         _ = Task.Run(RestartLoopAsync);
     }
@@ -443,6 +526,9 @@ public sealed class ProcessSupervisor : IDisposable
             for (int attempt = 1; attempt <= _options.MaxRestartAttempts && !_disposed; attempt++)
             {
                 TimeSpan delay = ComputeBackoffDelay(attempt);
+                _logger.LogInformation(
+                    "Restart attempt {Attempt}/{MaxAttempts} in {DelayMs} ms",
+                    attempt, _options.MaxRestartAttempts, delay.TotalMilliseconds);
                 try
                 {
                     await Task.Delay(delay, _lifetimeCts.Token).ConfigureAwait(false);
@@ -456,14 +542,17 @@ public sealed class ProcessSupervisor : IDisposable
                 {
                     CleanupForRestart();
                     (_process, _channelListener, _token) = CreateProcessAndListener();
-                    Port = _channelListener.Port;
                     await LaunchAsync(_lifetimeCts.Token).ConfigureAwait(false);
                     RestartCount++;
+                    _logger.LogInformation(
+                        "Restart attempt {Attempt} succeeded - new session {SessionId} on endpoint {ChannelArgument}",
+                        attempt, SessionId, _channelListener.ChannelArgument);
                     return; // LaunchAsync already set State = Ready
                 }
                 catch (Exception ex)
                 {
                     LastFault = ex;
+                    _logger.LogWarning(ex, "Restart attempt {Attempt} failed", attempt);
                 }
             }
 
@@ -471,6 +560,9 @@ public sealed class ProcessSupervisor : IDisposable
             {
                 IsPermanentlyFailed = true;
                 State = SupervisorState.Faulted;
+                _logger.LogError(
+                    "Giving up after {MaxAttempts} restart attempts - supervisor is permanently failed",
+                    _options.MaxRestartAttempts);
             }
         }
         finally
@@ -1158,6 +1250,16 @@ public sealed class ProcessSupervisor : IDisposable
 
         _disposed = true;
         State = SupervisorState.Disposed;
+        _logger.LogInformation("Disposing - sending graceful shutdown to the R worker");
+
+        try
+        {
+            AppDomain.CurrentDomain.ProcessExit -= _processExitHandler;
+        }
+        catch
+        {
+            // Best-effort teardown.
+        }
 
         _lifetimeCts.Cancel(); // unblocks a RestartLoopAsync sitting in its backoff delay
         _heartbeatCts?.Cancel();

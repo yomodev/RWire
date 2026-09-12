@@ -11,4 +11,13 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Abstractions only - RWire never chooses a logging backend for
+         you; the host application wires up whatever ILoggerFactory it
+         already uses (Serilog, NLog, Microsoft.Extensions.Logging's
+         console/file providers, ...). See ProcessSupervisor's
+         constructor overload taking an ILogger. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+
 </Project>

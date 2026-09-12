@@ -25,10 +25,19 @@ public class RConnectionTests : IAsyncLifetime
         _listener.Start();
         int port = ((IPEndPoint)_listener.LocalEndpoint).Port;
 
-        var acceptTask = _listener.AcceptTcpClientAsync(TestContext.Current.CancellationToken);
+        // AcceptTcpClientAsync(CancellationToken) returns ValueTask<TcpClient>
+        // (the no-argument overload returns Task<TcpClient> instead - an
+        // easy mismatch, which is exactly what broke the build here
+        // before). `var` below sidesteps needing to know whether
+        // ConnectAsync's return type is Task or ValueTask too - either
+        // way it's awaited after the accept has been kicked off, so
+        // both sides of the handshake are in flight concurrently.
+        ValueTask<TcpClient> acceptTask = _listener.AcceptTcpClientAsync(TestContext.Current.CancellationToken);
         _clientSide = new TcpClient();
-        await _clientSide.ConnectAsync(IPAddress.Loopback, port, TestContext.Current.CancellationToken);
+        var connectTask = _clientSide.ConnectAsync(IPAddress.Loopback, port, TestContext.Current.CancellationToken);
+
         _serverSide = await acceptTask;
+        await connectTask;
     }
 
     public ValueTask DisposeAsync()
@@ -36,6 +45,7 @@ public class RConnectionTests : IAsyncLifetime
         _clientSide.Dispose();
         _serverSide.Dispose();
         _listener.Stop();
+        GC.SuppressFinalize(this);
         return ValueTask.CompletedTask;
     }
 
