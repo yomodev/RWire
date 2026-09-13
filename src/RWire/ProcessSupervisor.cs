@@ -271,7 +271,23 @@ public sealed class ProcessSupervisor : IProcessSupervisor
 
     private void OnProcessExited()
     {
-        if (State is SupervisorState.Starting or SupervisorState.Ready or SupervisorState.Busy)
+        // Deliberately excludes Starting: a crash before the initial
+        // handshake completes must NOT trigger the automatic-restart
+        // machinery, because LaunchAsync's own in-flight call (the one
+        // currently running as part of this same StartAsync) is still
+        // using the very same _channelListener/_connection that
+        // CleanupForRestart would immediately dispose out from under
+        // it - which aborts the in-flight AcceptAsync/ReceiveAsync
+        // with a raw SocketException instead of letting the intended
+        // HandshakeTimeout->TimeoutException path (or this exact
+        // exception, surfaced directly) reach the caller. This also
+        // matches this class's own documented intent for the initial
+        // launch: "a failure here is never retried" (see LaunchAsync's
+        // doc comment) - retrying with the same configuration that
+        // just failed during Starting wouldn't help, so there's
+        // nothing for an automatic restart to usefully do here; the
+        // exception from the in-flight call is the correct signal.
+        if (State is SupervisorState.Ready or SupervisorState.Busy)
         {
             _logger.LogWarning("R worker process exited unexpectedly while in state {State}", State);
             Fault(new InvalidOperationException(
@@ -486,8 +502,43 @@ public sealed class ProcessSupervisor : IProcessSupervisor
     /// own catch block can all race to report the same crash) - only
     /// one restart loop ever runs at a time.
     /// </summary>
-    private void Fault(Exception cause)
+    /// <summary>
+    /// Records cause as the current fault and, unless a restart is
+    /// already underway or the supervisor is disposed, transitions to
+    /// Restarting and kicks off the background restart loop. Safe to
+    /// call from multiple places observing the same underlying failure
+    /// (the heartbeat loop, Process.Exited, and an in-flight call's
+    /// own catch block can all race to report the same crash) - only
+    /// one restart loop ever runs at a time.
+    ///
+    /// observedSessionId lets a caller that captured SessionId before
+    /// starting its own operation guard against reporting a STALE
+    /// fault: CleanupForRestart/RestartLoopAsync/LaunchAsync mutate
+    /// _connection without ever taking _connectionLock (by design -
+    /// see docs/phases/processsupervisor-decomposition.md), so a
+    /// heartbeat tick that was already in flight when a restart began
+    /// can still be sitting on its own (much longer)
+    /// HeartbeatResponseTimeout when that restart finishes - and can
+    /// then report a failure about a connection that's already been
+    /// replaced by a newer, healthy one. Without this guard, that
+    /// stale report would spuriously interrupt an already-successful
+    /// restart. Pass null (the default) when the caller has no
+    /// meaningful session to compare against (e.g. OnProcessExited,
+    /// which is tied 1:1 to a specific OS process instance rather than
+    /// a session).
+    /// </summary>
+    private void Fault(Exception cause, ulong? observedSessionId = null)
     {
+        if (observedSessionId.HasValue && observedSessionId.Value != SessionId)
+        {
+            _logger.LogDebug(
+                cause,
+                "Ignoring a fault reported against session {ObservedSessionId} - " +
+                "current session is already {CurrentSessionId}, so this has already been superseded",
+                observedSessionId.Value, SessionId);
+            return;
+        }
+
         LastFault = cause;
 
         if (_disposed)
@@ -1248,6 +1299,7 @@ public sealed class ProcessSupervisor : IProcessSupervisor
                 continue;
             }
 
+            ulong observedSessionId = SessionId;
             try
             {
                 uint correlationId = _connection!.NextCorrelationId();
@@ -1268,7 +1320,7 @@ public sealed class ProcessSupervisor : IProcessSupervisor
             {
                 // Heartbeat-specific timeout (responseTimeoutCts), not
                 // supervisor shutdown - the connection is unresponsive.
-                Fault(ex);
+                Fault(ex, observedSessionId);
             }
             catch (OperationCanceledException)
             {
@@ -1277,7 +1329,7 @@ public sealed class ProcessSupervisor : IProcessSupervisor
             }
             catch (Exception ex)
             {
-                Fault(ex);
+                Fault(ex, observedSessionId);
             }
             finally
             {
